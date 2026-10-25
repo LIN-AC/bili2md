@@ -1,0 +1,47 @@
+__pycache__/
+*.pyc
+config.toml
+subtitles/
+*cookies*.txt
+*.m4a
+
+# 本地配置和凭证；仅提交不含秘密的示例配置。
+config/*
+!config/settings.example.json
+!config/README.md
+.env
+.env.*
+!.env.example
+
+# 其他凭证和密钥文件。
+.aws/
+.ssh/
+credentials*.json
+secrets.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 本地音视频、下载残片及转录中间产物。
+*.aac
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.opus
+*.mp4
+*.webm
+*.part
+*.ytdl
+transcript*.txt
+tmp/
+temp/
+
+# Python 本地环境和测试缓存。
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyo
