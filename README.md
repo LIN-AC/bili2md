@@ -1,9 +1,9 @@
-# 当前可运行版本：中文字幕、本地 ASR 及 Ollama 总结
+# 当前可运行版本：中文字幕、本地 ASR、Ollama 及云端 API 总结
 
-已验证版本：**1.1**（Git 标签 `v1.1`）。
+已验证版本：**1.2**（Git 标签 `v1.2`）。
 
 使用 Python 3.10+ 标准库调用本机已安装的 `bilibili-subtitle-fetch`，无需为本项目安装 Python 依赖。
-优先获取视频已有中文字幕（包括可访问的中文 AI 字幕），保存 UTF-8 纯文本。仍向字幕工具明确传入 `--no-asr`，由本项目控制无中文字幕时的本地 whisper.cpp 兜底。可选调用本机 Ollama 生成中文 Markdown 总结；不指定 `--ollama-model` 时保持仅保存字幕的原行为。不接入云端 API。
+优先获取视频已有中文字幕（包括可访问的中文 AI 字幕），保存 UTF-8 纯文本。仍向字幕工具明确传入 `--no-asr`，由本项目控制无中文字幕时的本地 whisper.cpp 兜底。可选本机 Ollama 或 OpenAI-compatible API 生成中文 Markdown 总结；不指定 `--ollama-model` 或 `--api-model` 时保持仅保存字幕的原行为。
 
 ```powershell
 python bili2md.py "https://www.bilibili.com/video/BV1zvnb6eEMP"
@@ -98,7 +98,34 @@ python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --ollama-model "q
 
 2026-10-25 第三轮实测：先用已有 `subtitles/BV1BgNb6oEnk_p1.txt` 和本机 `qwen2.5:7b` 成功生成 Markdown，再使用同一两分钟视频验证从链接经 ASR 到总结的完整流程。原文仍保存为 650 字符，总结输出到 `summaries/BV1BgNb6oEnk_p1.md`。26 项 Python 测试通过；服务不可连接、模型不存在、超时、无效响应和失败保护等分支使用模拟响应验证，没有关闭或改动本机 Ollama 服务。
 
-以下保留原始项目规划，云端模型 API 和 HTML 报告尚未实现。
+## OpenAI-compatible 云端 API 总结（第四轮）
+
+第一版仅实现非流式 Chat Completions：向 `<base_url>/chat/completions` 发送 `model`、`messages` 和 `stream: false`，读取 `choices[0].message.content`。协议参考 [OpenAI 官方 Chat Completions 文档](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。不自动选择模型、下载模型、调用付费接口试探或在失败时切换供应商。
+
+先在运行程序的环境中配置 API Key，默认环境变量名为 `BILI2MD_API_KEY`。若凭证已存放在其他环境变量，用 `--api-key-env` 传入**变量名称**。不要把 Key 写入源码、命令参数或配置文件。程序不读取 `.env`；如使用该文件，应由你自己的运行环境加载，文件已被 Git 忽略。
+
+下面的地址和模型均为占位示例，使用时替换为自己提供的配置，示例不包含认证值：
+
+```powershell
+# 已有文本 → API → Markdown；运行前已设置相应环境变量
+python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --api-base-url "https://api.example.com/v1" --api-model "YOUR_MODEL" --api-key-env "BILI2MD_API_KEY"
+
+# 视频链接 → 原有字幕/ASR → API → Markdown
+python bili2md.py "https://www.bilibili.com/video/BV1BgNb6oEnk" --api-base-url "https://api.example.com/v1" --api-model "YOUR_MODEL" --summary-output "summaries/api-summary.md"
+```
+
+- `--api-model`：指定模型并选择云端总结；与 `--ollama-model` 互斥。
+- `--api-base-url`：必填根地址，按服务要求包含 `/v1` 或其他前缀，不包含 `/chat/completions`；禁止在 URL 中放认证信息。云端使用 HTTPS，本机模拟允许 HTTP。
+- `--api-key-env`：环境变量名，默认 `BILI2MD_API_KEY`，认证值只用于 Bearer 请求头。
+- `--api-timeout`：单次请求超时秒数，默认 600；不会自动重试，避免额外请求。
+
+API 和 Ollama 复用相同总结提示词、`--input-text`、`--summary-output`、Markdown 文件命名及原子保存流程，不改变字幕、ASR 或 whisper.cpp 的 `--model` 参数。默认总结输出到 `summaries`，原文保留。
+
+缺少凭证、模型或地址会在访问视频前报错；401/403、404、429、服务错误、超时及格式错误均有明确提示。失败时不保存新总结、不覆盖已有总结；链接流程已生成的字幕仍保留。错误提示不输出 Key、响应正文、认证头或请求 URL；重定向被拒绝，避免向其他地址转发认证信息。仅接受正常完成且非空的文本，不保存被截断的结果。
+
+测试范围：已验证本机伪 API HTTP 链路、参数及认证传递、错误脱敏、Markdown 保存和原文保护。2026-10-26 使用用户提供的 DeepSeek 官方地址、`deepseek-flash` 模型及 `DEEPSEEK_API_KEY` 环境变量，基于已保存的短字幕完成一次真实 API 请求，成功生成 3,482 字节 Markdown，原字幕哈希未变；未重复运行字幕提取或 ASR，未查看、输出或记录 Key 实际值。`v1.1` 保留为第三轮版本，`v1.2` 包含第四轮云端 API 功能。
+
+以下保留原始项目规划，HTML 报告尚未实现。
 
 # 组织结构图
 ## b站视频自动总结项目

@@ -1,6 +1,7 @@
 """优先获取 B 站字幕，无字幕且登录有效时使用本地 whisper.cpp 转录。"""
 
 import argparse
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import zipfile
 from urllib.parse import parse_qs, urlparse
 
 from ollama_summary import SummaryError, summarize_file
+import api_summary
 
 
 class SubtitleError(Exception):
@@ -298,22 +300,38 @@ def main() -> int:
     parser.add_argument("--subtitle-python", help="字幕工具所属 Python，默认从 Windows 启动器识别")
     parser.add_argument("--no-asr", action="store_true", help="关闭本项目 ASR 兜底，保持仅提取字幕")
     parser.add_argument("--input-text", type=Path, help="读取已有 UTF-8 字幕/ASR 文本，只生成总结")
-    parser.add_argument("--ollama-model", help="启用总结，并指定本机 Ollama 模型名")
+    summaries = parser.add_mutually_exclusive_group()
+    summaries.add_argument("--ollama-model", help="启用总结，并指定本机 Ollama 模型名")
+    summaries.add_argument("--api-model", help="启用云端 API 总结，指定兼容接口的模型名")
+    parser.add_argument("--api-base-url", help="OpenAI-compatible API 根地址，通常包含 /v1")
+    parser.add_argument("--api-key-env", default="BILI2MD_API_KEY", help="保存 API Key 的环境变量名称")
+    parser.add_argument("--api-timeout", type=positive_seconds, default=600, help="API 总结请求超时秒数")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="本机 Ollama 服务地址")
     parser.add_argument("--ollama-timeout", type=positive_seconds, default=600, help="总结请求超时秒数")
     parser.add_argument("--summary-output", type=Path, help="总结 Markdown 路径，默认 summaries/<字幕文件名>.md")
     args = parser.parse_args()
     if args.input_text and (args.url or args.output):
         parser.error("--input-text 不能与视频链接或 --output 同时使用")
-    if (args.input_text or args.summary_output) and not args.ollama_model:
-        parser.error("生成总结需要 --ollama-model 指定模型名称")
+    if (args.input_text or args.summary_output) and not (args.ollama_model or args.api_model):
+        parser.error("生成总结需要 --ollama-model 或 --api-model 指定模型名称")
+    if args.api_base_url and args.api_model is None:
+        parser.error("--api-base-url 需要同时指定 --api-model")
     if args.ollama_model is not None and not args.ollama_model.strip():
         parser.error("--ollama-model 不能为空")
     try:
+        summary_model = args.ollama_model or args.api_model
+        summary_url = args.ollama_url
+        summary_timeout = args.ollama_timeout
+        summary_options = {}
+        summary_label = "Ollama"
+        if args.api_model is not None:
+            api_summary.api_config(args.api_model, args.api_base_url, args.api_key_env)
+            summary_url, summary_timeout, summary_label = args.api_base_url, args.api_timeout, "API"
+            summary_options["generator"] = partial(api_summary.generate_summary, api_key_env=args.api_key_env)
         if args.input_text:
-            print(f"正在使用 Ollama 模型 {args.ollama_model} 总结……", file=sys.stderr)
-            summary = summarize_file(args.input_text, args.ollama_model, args.summary_output,
-                                     args.ollama_url, args.ollama_timeout)
+            print(f"正在使用 {summary_label} 总结……", file=sys.stderr)
+            summary = summarize_file(args.input_text, summary_model, args.summary_output,
+                                     summary_url, summary_timeout, **summary_options)
             print(f"总结已保存：{summary.resolve()}")
             return 0
         url = validate_url(args.url or input("请输入 B 站视频链接："))
@@ -349,10 +367,10 @@ def main() -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(text + "\n", encoding="utf-8")
         print(f"字幕已保存：{output.resolve()}（{len(text)} 字符）")
-        if args.ollama_model:
-            print(f"正在使用 Ollama 模型 {args.ollama_model} 总结……", file=sys.stderr)
-            summary = summarize_file(output, args.ollama_model, args.summary_output,
-                                     args.ollama_url, args.ollama_timeout, video_url=url)
+        if summary_model:
+            print(f"正在使用 {summary_label} 总结……", file=sys.stderr)
+            summary = summarize_file(output, summary_model, args.summary_output,
+                                     summary_url, summary_timeout, video_url=url, **summary_options)
             print(f"总结已保存：{summary.resolve()}")
         return 0
     except (SubtitleError, SummaryError, OSError, EOFError) as exc:
