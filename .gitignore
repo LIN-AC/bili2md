@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 config.toml
 subtitles/
+summaries/
 *cookies*.txt
 *.m4a
 

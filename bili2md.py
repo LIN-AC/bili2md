@@ -12,6 +12,8 @@ import tempfile
 import zipfile
 from urllib.parse import parse_qs, urlparse
 
+from ollama_summary import SummaryError, summarize_file
+
 
 class SubtitleError(Exception):
     """可以直接展示给用户的提取错误。"""
@@ -295,8 +297,25 @@ def main() -> int:
                         help="下载、转换、转录各阶段超时秒数，默认 3600")
     parser.add_argument("--subtitle-python", help="字幕工具所属 Python，默认从 Windows 启动器识别")
     parser.add_argument("--no-asr", action="store_true", help="关闭本项目 ASR 兜底，保持仅提取字幕")
+    parser.add_argument("--input-text", type=Path, help="读取已有 UTF-8 字幕/ASR 文本，只生成总结")
+    parser.add_argument("--ollama-model", help="启用总结，并指定本机 Ollama 模型名")
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="本机 Ollama 服务地址")
+    parser.add_argument("--ollama-timeout", type=positive_seconds, default=600, help="总结请求超时秒数")
+    parser.add_argument("--summary-output", type=Path, help="总结 Markdown 路径，默认 summaries/<字幕文件名>.md")
     args = parser.parse_args()
+    if args.input_text and (args.url or args.output):
+        parser.error("--input-text 不能与视频链接或 --output 同时使用")
+    if (args.input_text or args.summary_output) and not args.ollama_model:
+        parser.error("生成总结需要 --ollama-model 指定模型名称")
+    if args.ollama_model is not None and not args.ollama_model.strip():
+        parser.error("--ollama-model 不能为空")
     try:
+        if args.input_text:
+            print(f"正在使用 Ollama 模型 {args.ollama_model} 总结……", file=sys.stderr)
+            summary = summarize_file(args.input_text, args.ollama_model, args.summary_output,
+                                     args.ollama_url, args.ollama_timeout)
+            print(f"总结已保存：{summary.resolve()}")
+            return 0
         url = validate_url(args.url or input("请输入 B 站视频链接："))
         if args.config and not args.config.is_file():
             raise SubtitleError("配置错误：指定的 cookie 配置文件不存在。")
@@ -330,8 +349,13 @@ def main() -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(text + "\n", encoding="utf-8")
         print(f"字幕已保存：{output.resolve()}（{len(text)} 字符）")
+        if args.ollama_model:
+            print(f"正在使用 Ollama 模型 {args.ollama_model} 总结……", file=sys.stderr)
+            summary = summarize_file(output, args.ollama_model, args.summary_output,
+                                     args.ollama_url, args.ollama_timeout, video_url=url)
+            print(f"总结已保存：{summary.resolve()}")
         return 0
-    except (SubtitleError, OSError, EOFError) as exc:
+    except (SubtitleError, SummaryError, OSError, EOFError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

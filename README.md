@@ -1,7 +1,9 @@
-# 当前可运行版本：获取字幕及本地 ASR 兜底
+# 当前可运行版本：中文字幕、本地 ASR 及 Ollama 总结
+
+已验证版本：**1.1**（Git 标签 `v1.1`）。
 
 使用 Python 3.10+ 标准库调用本机已安装的 `bilibili-subtitle-fetch`，无需为本项目安装 Python 依赖。
-优先获取视频已有中文字幕（包括可访问的中文 AI 字幕），保存 UTF-8 纯文本。仍向字幕工具明确传入 `--no-asr`，由本项目控制无中文字幕时的本地 whisper.cpp 兜底。不调用 Ollama 或总结模型。
+优先获取视频已有中文字幕（包括可访问的中文 AI 字幕），保存 UTF-8 纯文本。仍向字幕工具明确传入 `--no-asr`，由本项目控制无中文字幕时的本地 whisper.cpp 兜底。可选调用本机 Ollama 生成中文 Markdown 总结；不指定 `--ollama-model` 时保持仅保存字幕的原行为。不接入云端 API。
 
 ```powershell
 python bili2md.py "https://www.bilibili.com/video/BV1zvnb6eEMP"
@@ -67,7 +69,36 @@ python bili2md.py "https://www.bilibili.com/video/BV1BgNb6oEnk" --no-asr
 
 2026-10-25 新增调用链路实测：用户提供的两分钟视频 `BV1BgNb6oEnk`，默认字幕 Cookie 失效时被正确识别，随后用项目 Netscape Cookie 验证登录并重新确认无字幕，完成 yt-dlp 下载、FFmpeg WAV 转换、本地 large-v3-turbo 中文转录，保存到 `subtitles/BV1BgNb6oEnk_p1.txt`（650 字符）。原有有字幕视频 `BV1zvnb6eEMP` 仍成功提取 5,312 字符，未启动 ASR。Python 单元测试还覆盖登录失效不启动 ASR、凭证更新后重新找到字幕、外部调用失败及空转录文件等分支；这些失败分支使用模拟响应。
 
-以下保留原始项目规划，其中模型总结尚未实现。
+## 本地 Ollama 中文总结
+
+先启动本机 Ollama，并准备好要使用的模型。程序不会下载模型，也不会写死模型名。可用 `ollama list` 查看本机模型；下面的 `qwen2.5:7b` 仅为本轮实测示例，请替换为已安装的模型名称。
+
+```powershell
+# 读取已有 UTF-8 字幕或 ASR 文本，不访问 B 站、不重新转录
+python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --ollama-model "qwen2.5:7b"
+
+# 完整流程：字幕提取 / ASR → 保存原文 → 本地 Ollama → Markdown
+python bili2md.py "https://www.bilibili.com/video/BV1BgNb6oEnk" --ollama-model "qwen2.5:7b"
+
+# 自定义总结路径和请求超时
+python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --ollama-model "qwen2.5:7b" --summary-output "summaries/demo.md" --ollama-timeout 600
+```
+
+- `--ollama-model`：指定模型并启用总结。已有的 `--model` 仍表示 whisper.cpp 模型文件，含义不变。
+- `--input-text`：读取已有文本，必须指定总结模型；不能同时传视频链接或 `--output`。
+- `--summary-output`：Markdown 输出路径，默认 `summaries/<字幕文件名>.md`。`--output` 仍只控制原字幕的路径。
+- `--ollama-url`：本机服务地址，默认 `http://127.0.0.1:11434`，仅支持本机回环地址；请求绕过代理。
+- `--ollama-timeout`：单次总结请求超时秒数，默认 600。
+
+实现复用 Ollama 官方 [`POST /api/generate`](https://docs.ollama.com/api/generate)，使用 `stream: false`，读取完成响应中的 `response`。总结包含模型和原字幕文件名；从链接运行时也记录视频来源。原始字幕不被总结覆盖，生成结果目录已加入 `.gitignore`。
+
+服务无法连接、超时、模型不存在、HTTP/API 错误、无效响应或空总结都会明确报错并返回退出码 1；失败时不创建新总结、不覆盖已有总结。链接流程中已保存的字幕仍会保留，可稍后用 `--input-text` 重试。
+
+当前最小版本将整份字幕一次性发送给模型，不分块处理长视频；输入和输出受所选模型的上下文及生成能力限制。总结基于字幕表述，可能继承转录或模型错误，不能替代事实核验。
+
+2026-10-25 第三轮实测：先用已有 `subtitles/BV1BgNb6oEnk_p1.txt` 和本机 `qwen2.5:7b` 成功生成 Markdown，再使用同一两分钟视频验证从链接经 ASR 到总结的完整流程。原文仍保存为 650 字符，总结输出到 `summaries/BV1BgNb6oEnk_p1.md`。26 项 Python 测试通过；服务不可连接、模型不存在、超时、无效响应和失败保护等分支使用模拟响应验证，没有关闭或改动本机 Ollama 服务。
+
+以下保留原始项目规划，云端模型 API 和 HTML 报告尚未实现。
 
 # 组织结构图
 ## b站视频自动总结项目
