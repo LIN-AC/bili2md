@@ -1,6 +1,7 @@
 # bili2md：B 站信息、中文字幕、本地 ASR 与视频总结
 
-当前版本：**1.3.1**（Git 标签 `v1.3.1`）。
+当前版本：**1.3.1**。`main` 包含 Cookie、字符串处理优化，以及异常边界、请求级重试和 CC 字幕修复。
+Git 标签 `v1.3.1` 保留首次发布的优化前快照；获取上述修复请使用 `main`。
 Python 3.10+ 标准库实现，不需要安装 Python 依赖。
 
 ## 使用方式
@@ -20,6 +21,7 @@ python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --ollama-model "q
 ```
 
 省略链接时交互输入。支持 BV 视频链接、分 P 和 B 站短链接。
+分 P 参数仅接受单个 ASCII 正整数；空值、重复参数、正负号或非法端口会明确报错。
 默认原文为 `subtitles/<BV号>_p<分P号>.txt`，保持 UTF-8 纯文本；
 同名 `.meta.json` 保存标题、简介、BV/AID/CID、分 P、时长、视频链接、文本来源、字幕状态和原文哈希，
 不保存 Cookie 或字幕签名 URL。短链接沿用解析后的 BV 和分 P 命名。
@@ -42,11 +44,16 @@ python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --ollama-model "q
 | other_languages | 有其他语言、无中文候选，下载前校验通过后运行 ASR |
 | no_subtitles | 字幕字段明确为 null 或 []，且登录有效，下载前校验通过后运行 ASR |
 | access_denied | 付费/订阅权限不足、轨道锁定或明确登录限制，报错终止 |
-| request_failed | 请求、结构、正文异常或结果不确定，重试一次；仍失败则终止，不进入 ASR |
+| request_failed | 请求失败、结构异常或结果不确定时终止，不进入 ASR；仅暂时性网络故障重试目标请求一次 |
 
 语言依据每条轨道的 lan，包括 ai-zh、zh 及中文变体。ai_type=0 不等于人工字幕；
 顶层空 lan、asr_language 不是字幕存在依据。`--preferred-lang` 仅影响中文候选优先级。
+首选语言比较忽略大小写，并将下划线统一为连字符；保留人工/AI 前缀的区别。
 没有中文候选时不下载其他语言正文。
+
+轨道 `type=0` 表示 CC，不受 AI 的 `ai_status=2` 要求限制；`type=1` 的 AI 轨道仍需状态为 2。
+CC 正文可能不含 `lang`，此时依据目标 AID/CID 对应的 dm/view 轨道语言；正文若明确携带语言或视频标识，仍必须通过校验。
+不识别的轨道类型、锁定、非就绪状态或正文异常不会被当作无字幕。
 
 **不再请求播放器字幕接口或做该回退**：此前出现视频标识匹配但正文疑似串视频的问题。
 正文校验语言、结构、非空文本、时间范围及可选视频标识；这些检查不能普遍证明语义归属，
@@ -55,6 +62,19 @@ python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --ollama-model "q
 专属权限不足依据已验证组合 is_upower_exclusive=true、is_upower_play=false。
 其他付费标记若无法确认已购权益，按结果不确定终止。不以通用付费提示、rights.pay=0
 或单独的 is_upower_play=false 判定访问权限。
+
+## 异常边界与请求重试
+
+`parse_args()` 只处理 CLI 选项，`run_task(args)` 执行单次任务并向调用方抛出异常，`main()` 将错误转换为退出码。
+最外层保留 `raise SystemExit(main())`：成功为 0，配置/任务失败为 1，CLI 语法错误为 2，手动取消为 130。
+必要配置和初始化失败抛出 `ConfigurationError`；错误链接抛出 `InvalidVideoURL`，权限错误抛出 `AccessDenied`，
+其他业务错误抛出 `RequestFailed` 或已有的 `SubtitleError` / `SummaryError`。调用业务函数不会退出进程。
+
+输入 URL 只在提取入口解析一次；短链接的每个目标在访问前单独校验，并复用解析出的 BV 和整数分 P。
+超时、连接中断、临时 DNS 故障及 HTTP 408/500/502/503/504 最多尝试两次（首次加一次重试）。
+重试限定在失败的 JSON 请求或短链接当前跳转，不重新执行已经成功的视频信息、字幕列表或输入解析。
+业务错误、JSON/正文结构错误、权限错误、证书错误及其他 HTTP 错误不自动重试；超过上限明确抛出异常。
+短链接另有循环检查和最多 10 跳限制。模型生成及收费 API 不加入此重试流程。
 
 ## 统一 Cookie
 
@@ -66,9 +86,11 @@ python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --ollama-model "q
 `--cookies` > 环境变量 `BILI2MD_COOKIES` > JSON 的 cookies。
 相对路径以 JSON 所在目录解析，`--settings` 可指定其他 JSON 文件。
 
-直接接口和 yt-dlp 使用同一配置。没有文件时可匿名尝试字幕，取得有效中文不强制登录；
-匿名或失效登录下的空列表不能确认无字幕。ASR 下载前必须有有效文件并通过登录检查。
-正文请求不携带账号 Cookie，日志不输出完整签名 URL。yt-dlp 使用临时 Cookie 副本；
+Cookie 在客户端初始化时加载一次，并过滤过期条目。没有文件时可匿名尝试字幕，取得有效中文不强制登录；
+匿名或失效登录下的空列表不能确认无字幕。ASR 下载前检查内存中的有效 B 站 Cookie 和登录状态。
+同次提取中，一分钟内的成功登录检查可复用；新提取或验证超时后重新检查。
+正文请求不携带账号 Cookie，日志不输出完整签名 URL。yt-dlp 使用通过登录检查的内存 Cookie 导出的临时副本，
+不重新读取或回写原 Cookie 文件；运行中替换原文件需重新运行才生效。
 真实凭证、本地配置、原文、元数据及总结目录均由 .gitignore 排除。
 
 ## 本地 ASR
@@ -119,6 +141,16 @@ python -m unittest -q
 本轮 Mock 覆盖五态、匿名中文、登录失效、异常重试、分 P/CID、正文异常、付费阻断、
 ASR 调度、标题简介到 Markdown 及原文哈希保护。保留 ASR、Ollama 和 API 回归，
 不在回归中调用真实转录或模型服务。
+
+后续优化新增 Cookie 登录复用与过期、下载凭证快照、URL 边界、语言优先级、
+空字幕元数据及单次读盘校验的回归测试。总结前先检查字幕非空，正文解码与哈希使用同一份文件字节。
+
+2026-10-28 Code Review 修复后，71 项完整回归通过。新增连续字幕请求失败、正文/登录请求重试边界、
+不可重试错误、短链接循环、配置/任务异常传播及 CC 多分 P 归属检查。
+真实回归样本 [BV1YRnW6LESu](https://www.bilibili.com/video/BV1YRnW6LESu) 第 1 P：
+CC 轨道 `type=0, lan=zh, ai_status=0`，正文无 `lang`；成功保存 118 段、985 字符，未运行 ASR。
+输入解析、视频信息、字幕列表、CC 正文各执行一次。脱敏字段结构保存在 `test_fixtures/cc_BV1YRnW6LESu.json`，
+离线回归使用占位正文，不保存 Cookie、签名参数或完整视频字幕。
 
 2026-10-26 新模块真实查询四个已有样本：
 - BV1zvnb6eEMP：有效中文字幕 5,312 字符，原文及元数据保存通过。

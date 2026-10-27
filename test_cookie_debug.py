@@ -39,11 +39,10 @@ def trace_scenario(tracks):
         with patch.object(client.opener, "open", side_effect=response), patch.object(client.body_opener, "open", side_effect=response):
             result = client.fetch(URL)
             if result.state is not SubtitleState.CHINESE:
-                client.require_download_cookie()
                 with patch("bili2md.require_program", side_effect=lambda value, name: value), \
                      patch("bili2md.run_external", side_effect=bili2md.SubtitleError("模拟下载入口停止")):
                     try:
-                        bili2md.transcribe_audio(URL, path, "mock-ytdlp", "mock-ffmpeg", "mock-whisper", model, 10)
+                        bili2md.transcribe_audio(result.info, client, "mock-ytdlp", "mock-ffmpeg", "mock-whisper", model, 10)
                     except bili2md.SubtitleError:
                         pass
     return log.getvalue()
@@ -71,7 +70,7 @@ class CookieDebugTests(unittest.TestCase):
         self.assertIn("event=operation checks=1", log.getvalue())
 
     def test_counts_cover_chinese_other_languages_and_no_subtitles(self):
-        for tracks, count, auth_calls in [([zh_track()], 2, 0), ([{"lan": "ai-en"}], 8, 1), (None, 9, 2)]:
+        for tracks, count, auth_calls in [([zh_track()], 2, 0), ([{"lan": "ai-en"}], 4, 1), (None, 4, 1)]:
             with self.subTest(count=count):
                 log = trace_scenario(tracks)
                 checks = [int(x) for x in re.findall(r"event=check checks=(\d+)", log)]

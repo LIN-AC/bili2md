@@ -89,8 +89,11 @@ def generate_summary(text: str, model: str, base_url: str, timeout: float,
         raise SummaryError("API 响应格式异常：缺少 choices 或总结正文。") from None
     if finish == "length":
         raise SummaryError("API 总结达到生成长度限制，未保存不完整总结。")
-    if finish != "stop" or not isinstance(content, str) or not content.strip():
+    if finish != "stop" or not isinstance(content, str):
+        raise SummaryError("API 未返回完整、非空的总结正文。")
+    content = content.strip()
+    if not content:
         raise SummaryError("API 未返回完整、非空的总结正文。")
     if key in content:
         raise SummaryError("API 返回内容包含认证信息，已拒绝保存。")
-    return content.strip()
+    return content

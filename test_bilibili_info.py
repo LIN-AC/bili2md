@@ -78,6 +78,21 @@ class BilibiliInfoTests(unittest.TestCase):
         self.assertEqual(result.languages, ("ai-en",))
         self.assertEqual(client._json.call_count, 2)
 
+    def test_preferred_language_normalizes_case_and_separator(self):
+        client = self.client([zh_track(lan="zh-TW"), zh_track(lan="zh_CN"), zh_track(lan="ai-zh")])
+        for preferred, expected in [(" zh-cn ", "zh_CN"), ("AI_ZH", "ai-zh")]:
+            with patch.object(client, "_body", return_value="中文") as body:
+                client.fetch(URL, preferred)
+                self.assertEqual(body.call_args.args[0]["lan"], expected)
+
+    def test_short_link_target_uses_same_url_rules(self):
+        for target in [URL.replace("p=1", "p=%2B2"), URL.replace("p=1", "p="),
+                       URL.replace("www.bilibili.com", "other.invalid")]:
+            with self.subTest(target=target), patch("bilibili_info.urllib.request.build_opener") as opener:
+                opener.return_value.open.return_value.__enter__.return_value.url = target
+                with self.assertRaises(RequestFailed):
+                    BilibiliClient()._resolve("https://b23.tv/example")
+
     def test_null_and_empty_confirm_no_subtitles_with_login(self):
         for tracks in [None, []]:
             client = self.client(tracks)
@@ -117,17 +132,7 @@ class BilibiliInfoTests(unittest.TestCase):
         client = self.client(None, data)
         with self.assertRaises(RequestFailed):
             client.fetch(URL)
-        self.assertEqual(client._json.call_count, 2)
-
-    def test_request_failure_retries_exactly_once(self):
-        client = BilibiliClient()
-        with patch.object(client, "_fetch", side_effect=[RequestFailed("网络错误"), make_result()]) as fetch:
-            self.assertEqual(client.fetch(URL).state, SubtitleState.CHINESE)
-            self.assertEqual(fetch.call_count, 2)
-        with patch.object(client, "_fetch", side_effect=RequestFailed("正文异常")) as fetch:
-            with self.assertRaises(RequestFailed):
-                client.fetch(URL)
-            self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(client._json.call_count, 1)
 
     def test_malformed_list_is_never_classified_as_empty(self):
         for value in [{}, "", False, 3, [{"lan": ""}], [{"lan": None}]]:
@@ -135,7 +140,7 @@ class BilibiliInfoTests(unittest.TestCase):
                 client = self.client(value)
                 with self.assertRaises(RequestFailed):
                     client.fetch(URL)
-                self.assertEqual(client._json.call_count, 4)
+                self.assertEqual(client._json.call_count, 2)
         client = self.client([])
         original = client._json.side_effect
         client._json.side_effect = lambda url, label, **kw: {"code": 0, "data": {"subtitle": {}}} if urlparse(url).path.endswith("/dm/view") else original(url, label, **kw)
@@ -189,11 +194,47 @@ class BilibiliInfoTests(unittest.TestCase):
             BilibiliClient().require_download_cookie()
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cookies.txt"
-            path.write_text("# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tFALSE\t0\tDUMMY\tTEST\n")
+            path.write_text("# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tFALSE\t4102444800\tDUMMY\tTEST\n")
             client = BilibiliClient(path)
             with patch.object(client, "_login") as login:
                 client.require_download_cookie()
                 login.assert_called_once()
+
+    def test_login_reuse_expires_and_resets_for_next_fetch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "cookies.txt"
+            path.write_text("# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tFALSE\t4102444800\tDUMMY\tTEST\n")
+            client = BilibiliClient(path)
+            with patch.object(client, "_api", return_value={"isLogin": True}) as api, \
+                 patch("bilibili_info.time.monotonic", return_value=100) as clock:
+                client._login()
+                clock.return_value = 159
+                client.require_download_cookie()
+                self.assertEqual(api.call_count, 1)
+                clock.return_value = 160
+                client.require_download_cookie()
+                self.assertEqual(api.call_count, 2)
+                with patch.object(client, "_resolve", side_effect=RequestFailed("输入错误")), self.assertRaises(RequestFailed):
+                    client.fetch(URL)
+                client.require_download_cookie()
+                self.assertEqual(api.call_count, 3)
+                # 失败不缓存成功状态，也不能在下一次调用时跳过登录。
+                api.return_value = {"isLogin": False}
+                with self.assertRaises(AccessDenied):
+                    client._login()
+                with self.assertRaises(AccessDenied):
+                    client.require_download_cookie()
+                self.assertEqual(api.call_count, 5)
+
+    def test_expired_or_other_domain_cookie_cannot_start_download(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "cookies.txt"
+            for domain, expiry in [(".bilibili.com", "1"), (".example.com", "4102444800")]:
+                path.write_text(f"# Netscape HTTP Cookie File\n{domain}\tTRUE\t/\tFALSE\t{expiry}\tDUMMY\tTEST\n")
+                client = BilibiliClient(path)
+                with patch.object(client, "_login") as login, self.assertRaises(AccessDenied):
+                    client.require_download_cookie()
+                login.assert_not_called()
 
 
 if __name__ == "__main__":

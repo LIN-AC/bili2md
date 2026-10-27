@@ -1,16 +1,20 @@
 """直接读取 B 站视频信息和 dm/view 字幕；不使用播放器字幕回退。"""
 from dataclasses import asdict, dataclass
 from enum import Enum
-from http.client import HTTPException
+import errno
+from http.client import HTTPException, IncompleteRead
 import http.cookiejar
 import json
 import math
 from pathlib import Path
 import re
+import socket
+import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from cookie_debug import cookie_check, cookie_operation
 
@@ -33,6 +37,18 @@ class AccessDenied(BilibiliError):
 
 class RequestFailed(BilibiliError):
     state = SubtitleState.REQUEST_FAILED
+
+
+class ConfigurationError(BilibiliError):
+    """启动配置或客户端初始化失败，不属于可重试的业务请求。"""
+
+
+class InvalidVideoURL(RequestFailed):
+    """当前任务的输入错误，不终止调用方进程。"""
+
+
+class TransientRequestFailed(RequestFailed):
+    """仅用于可重试的网络故障。"""
 
 
 @dataclass(frozen=True)
@@ -58,11 +74,49 @@ class VideoResult:
     languages: tuple[str, ...] = ()
 
 
+VIDEO_HOSTS = {"bilibili.com", "www.bilibili.com", "m.bilibili.com"}
+SHORT_HOSTS = {"b23.tv", "www.b23.tv", "bili2233.cn", "www.bili2233.cn"}
+MAX_REQUEST_ATTEMPTS = 2
+MAX_REDIRECTS = 10
+
+
+def parse_video_url(value: str):
+    """入口与短链接跳转共用规则；返回解析结果、可选 BV 号和整数分 P。"""
+    if not isinstance(value, str):
+        raise InvalidVideoURL("链接错误：请输入有效的 B 站视频链接。")
+    value = value.strip()
+    try:
+        parsed = urlparse(value)
+        if (parsed.scheme not in {"http", "https"} or
+                parsed.hostname not in VIDEO_HOSTS | SHORT_HOSTS or
+                parsed.username is not None or parsed.password is not None or
+                parsed.port not in (None, 443 if parsed.scheme == "https" else 80) or
+                parsed.params or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value)):
+            raise ValueError()
+    except ValueError:
+        raise InvalidVideoURL("链接错误：请输入有效的 B 站视频链接。") from None
+    match = re.fullmatch(r"/video/(BV[1-9A-HJ-NP-Za-km-z]{10})/?", parsed.path)
+    if parsed.hostname in VIDEO_HOSTS and not match:
+        raise InvalidVideoURL("链接错误：请使用包含 BV 号的视频链接。")
+    pages = parse_qs(parsed.query, keep_blank_values=True).get("p", ["1"])
+    try:
+        if len(pages) != 1 or not re.fullmatch(r"[0-9]+", pages[0]):
+            raise ValueError()
+        page = int(pages[0])
+        if page < 1:
+            raise ValueError()
+    except ValueError:
+        raise InvalidVideoURL("链接错误：分 P 参数 p 必须为单个正整数。") from None
+    return parsed, match[1] if parsed.hostname in VIDEO_HOSTS else None, page
+
+
+def normalize_language(language: str) -> str:
+    return language.strip().lower().replace("_", "-")
+
+
 def is_chinese(language: str) -> bool:
-    code = language.lower().replace("_", "-")
-    if code.startswith("ai-"):
-        code = code[3:]
-    return code.split("-")[0] in {"zh", "cmn", "yue"}
+    code = normalize_language(language).removeprefix("ai-")
+    return code.partition("-")[0] in {"zh", "cmn", "yue"}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -70,36 +124,51 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-class BilibiliRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        parsed = urlparse(newurl)
-        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
-            "www.bilibili.com", "bilibili.com", "m.bilibili.com", "b23.tv", "www.b23.tv",
-            "bili2233.cn", "www.bili2233.cn",
-        }:
-            raise RequestFailed("短链接重定向目标异常。")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
 class BilibiliClient:
     def __init__(self, cookies: Path | None = None, timeout: float = 120):
-        self.cookies = cookies
         self.timeout = timeout
+        self._login_checked_at = None
         self.jar = http.cookiejar.MozillaCookieJar()
         if cookies and cookie_check("BilibiliClient.__init__", "file_exists", cookies.exists):
             try:
                 cookie_check("BilibiliClient.__init__", "netscape_parse_expiry_filter",
                              lambda: self.jar.load(str(cookies), ignore_discard=True, ignore_expires=False))
             except (OSError, ValueError):
-                raise RequestFailed("Cookie 配置错误：需要有效的 Netscape Cookie 文件。") from None
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar), NoRedirect())
-        self.body_opener = urllib.request.build_opener(NoRedirect())
+                raise ConfigurationError("Cookie 配置错误：需要有效的 Netscape Cookie 文件。") from None
+        try:
+            self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar), NoRedirect())
+            self.body_opener = urllib.request.build_opener(NoRedirect())
+        except (OSError, ValueError) as exc:
+            raise ConfigurationError("B 站客户端初始化失败，请检查网络配置。") from exc
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
             "Referer": "https://www.bilibili.com/",
         }
 
     def _json(self, url, label, body=False):
+        return self._retry(lambda: self._json_once(url, label, body), label)
+
+    @staticmethod
+    def _http_error(exc, label):
+        status = exc.code
+        exc.close()
+        error = (TransientRequestFailed if status in {408, 500, 502, 503, 504} else
+                 AccessDenied if status in {401, 403} else RequestFailed)
+        raise error(f"{label}请求失败：HTTP {status}。") from None
+
+    @staticmethod
+    def _network_error(exc, label):
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        transient = (not isinstance(reason, ssl.SSLError) and (
+            isinstance(reason, (TimeoutError, ConnectionError, IncompleteRead)) or
+            isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN or
+            isinstance(reason, OSError) and reason.errno in {
+                errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED, errno.ECONNREFUSED,
+                errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPIPE}))
+        error = TransientRequestFailed if transient else RequestFailed
+        raise error(f"{label}网络请求失败或超时。") from None
+
+    def _json_once(self, url, label, body=False):
         if not body:
             cookie_operation("BilibiliClient._json", "http_cookie_processor_selection")
         try:
@@ -107,11 +176,9 @@ class BilibiliClient:
             with (self.body_opener if body else self.opener).open(request, timeout=self.timeout) as response:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
-            status = exc.code
-            exc.close()
-            raise RequestFailed(f"{label}请求失败：HTTP {status}。") from None
-        except (OSError, urllib.error.URLError, HTTPException):
-            raise RequestFailed(f"{label}网络请求失败或超时。") from None
+            self._http_error(exc, label)
+        except (OSError, urllib.error.URLError, HTTPException) as exc:
+            self._network_error(exc, label)
         except ValueError:
             raise RequestFailed(f"{label}响应不是有效 JSON。") from None
         if not isinstance(payload, dict):
@@ -130,34 +197,45 @@ class BilibiliClient:
             raise RequestFailed(f"{path}缺少有效 data 对象。")
         return data
 
-    def _retry(self, action):
-        for attempt in range(2):
+    def _retry(self, action, label):
+        for attempt in range(MAX_REQUEST_ATTEMPTS):
             try:
                 return action()
-            except RequestFailed:
-                if attempt:
-                    raise
-                print("B 站信息或字幕读取异常，重试一次……", file=sys.stderr)
+            except TransientRequestFailed as exc:
+                if attempt + 1 == MAX_REQUEST_ATTEMPTS:
+                    raise TransientRequestFailed(f"{exc}已尝试 {MAX_REQUEST_ATTEMPTS} 次，停止请求。") from None
+                print(f"{label}暂时性网络错误，重试一次……", file=sys.stderr)
+
+    def _redirect_target(self, url):
+        # 每一跳分别重试，已经成功的跳转不重新访问；不携带账号 Cookie。
+        try:
+            with self.body_opener.open(urllib.request.Request(url, headers=self.headers), timeout=self.timeout) as response:
+                return response.url
+        except urllib.error.HTTPError as exc:
+            if exc.code in {301, 302, 303, 307, 308}:
+                location = exc.headers.get("Location")
+                exc.close()
+                if not location:
+                    raise RequestFailed("短链接重定向缺少目标地址。") from None
+                try:
+                    return urljoin(url, location)
+                except ValueError:
+                    raise InvalidVideoURL("短链接重定向目标地址无效。") from None
+            self._http_error(exc, "短链接")
+        except (OSError, urllib.error.URLError, HTTPException) as exc:
+            self._network_error(exc, "短链接")
 
     def _resolve(self, url):
-        parsed = urlparse(url)
-        if parsed.hostname in {"b23.tv", "www.b23.tv", "bili2233.cn", "www.bili2233.cn"}:
-            try:
-                opener = urllib.request.build_opener(BilibiliRedirect())
-                with opener.open(urllib.request.Request(url, headers=self.headers), timeout=self.timeout) as response:
-                    parsed = urlparse(response.url)
-            except (OSError, urllib.error.URLError, HTTPException, ValueError):
-                raise RequestFailed("B 站短链接解析失败。") from None
-        match = re.fullmatch(r"/video/(BV[1-9A-HJ-NP-Za-km-z]{10})/?", parsed.path)
-        if parsed.hostname not in {"www.bilibili.com", "bilibili.com", "m.bilibili.com"} or not match:
-            raise RequestFailed("无法从链接取得有效 BV 号。")
-        try:
-            page = int(parse_qs(parsed.query).get("p", ["1"])[0])
-            if page < 1:
-                raise ValueError()
-        except ValueError:
-            raise RequestFailed("视频分 P 必须为正整数。") from None
-        return match[1], page
+        parsed, bvid, page = parse_video_url(url)
+        visited = set()
+        while bvid is None:
+            current = parsed.geturl()
+            if current in visited or len(visited) >= MAX_REDIRECTS:
+                raise RequestFailed("短链接重定向循环或超过次数上限。")
+            visited.add(current)
+            target = self._retry(lambda: self._redirect_target(current), "短链接")
+            parsed, bvid, page = parse_video_url(target)
+        return bvid, page
 
     @staticmethod
     def _permission(data):
@@ -199,20 +277,33 @@ class BilibiliClient:
                          f"https://www.bilibili.com/video/{bvid}/?p={page}")
 
     def _login(self):
+        self._login_checked_at = None
         data = cookie_check("BilibiliClient._login", "server_auth",
                             lambda: self._api("/x/web-interface/nav"))
         if data.get("isLogin") is not True:
             raise AccessDenied("Cookie 未登录或已失效，停止 ASR 下载。")
+        self._login_checked_at = time.monotonic()
 
     def require_download_cookie(self):
-        if not self.cookies or not cookie_check("BilibiliClient.require_download_cookie", "file_is_file", self.cookies.is_file) or not cookie_check(
+        if not cookie_check(
             "BilibiliClient.require_download_cookie", "bilibili_domain_presence",
-            lambda: any(c.domain.lstrip(".") == "bilibili.com" or c.domain.endswith(".bilibili.com") for c in self.jar)
+            lambda: any(not c.is_expired() and (c.domain.lstrip(".") == "bilibili.com" or
+                       c.domain.endswith(".bilibili.com")) for c in self.jar)
         ):
             raise AccessDenied("ASR 下载需要有效的 B 站 Netscape Cookie 文件。")
-        self._retry(self._login)
+        # 仅复用本次提取中最近一分钟的成功检查；新提取会清空缓存。
+        if self._login_checked_at is None or time.monotonic() - self._login_checked_at >= 60:
+            self._login()
+
+    @staticmethod
+    def _check_identity(data, info):
+        # dm/view 的 aid + oid 绑定目标分 P；响应携带标识时必须一致。
+        for key, expected in (("bvid", info.bvid), ("aid", info.aid), ("cid", info.cid)):
+            if key in data and (type(data[key]) is not type(expected) or data[key] != expected):
+                raise RequestFailed("字幕响应的视频标识与目标视频或分 P 不匹配。")
 
     def _body(self, track, info):
+        self._check_identity(track, info)
         url = track.get("subtitle_url")
         if not isinstance(url, str) or not url:
             raise RequestFailed("中文字幕轨道缺少正文地址，不能按无字幕处理。")
@@ -229,10 +320,11 @@ class BilibiliClient:
         if not valid_url:
             raise RequestFailed("中文字幕正文地址不属于已验证的 HTTPS 字幕源。")
         data = self._json(url, "中文字幕正文", body=True)
-        for key, expected in (("bvid", info.bvid), ("aid", info.aid), ("cid", info.cid)):
-            if key in data and data[key] != expected:
-                raise RequestFailed("中文字幕正文的视频标识不匹配。")
-        if not isinstance(data.get("lang"), str) or not is_chinese(data["lang"]):
+        self._check_identity(data, info)
+        # CC 正文只有样式和 body，语言来自绑定目标 CID 的 dm/view 轨道。
+        # AI 正文仍要求 lang；任何正文显式给出非中文/异常 lang 都拒绝。
+        if ("lang" in data or track.get("type") != 0) and (
+                not isinstance(data.get("lang"), str) or not is_chinese(data["lang"])):
             raise RequestFailed("中文字幕正文语言与轨道不符或缺失。")
         lines = data.get("body")
         if not isinstance(lines, list) or not lines:
@@ -244,22 +336,28 @@ class BilibiliClient:
             start, end = line.get("from"), line.get("to")
             if any(type(x) not in (int, float) or not math.isfinite(x) for x in (start, end)) or not 0 <= start <= end <= info.duration + 5:
                 raise RequestFailed("中文字幕时间范围与目标分 P 不符。")
-            if line["content"].strip():
-                text.append(line["content"].strip())
+            content = line["content"].strip()
+            if content:
+                text.append(content)
         if not text:
             raise RequestFailed("中文字幕正文没有有效文本。")
         return "\n".join(text)
 
-    def _fetch(self, url, preferred_lang):
+    def fetch(self, url, preferred_lang="zh-CN"):
+        self._login_checked_at = None
         bvid, page = self._resolve(url)
         self.headers["Referer"] = f"https://www.bilibili.com/video/{bvid}/"
         info = self._info(bvid, page)
         data = self._api("/x/v2/dm/view", {"aid": info.aid, "oid": info.cid, "type": 1})
+        self._check_identity(data, info)
+        if "oid" in data and (type(data["oid"]) is not int or data["oid"] != info.cid):
+            raise RequestFailed("字幕列表的 oid 与目标分 P 不匹配。")
         if data.get("need_login_subtitle") is True:
             raise AccessDenied("字幕接口要求登录或权限，不能判定为无字幕。")
         subtitle = data.get("subtitle")
         if not isinstance(subtitle, dict) or "subtitles" not in subtitle:
             raise RequestFailed("字幕列表字段缺失，不能判定为无字幕。")
+        self._check_identity(subtitle, info)
         tracks = subtitle["subtitles"]
         if tracks is None or tracks == []:
             # 匿名空列表不能证明没有隐藏轨道；仅空列表判定需要验证登录。
@@ -281,11 +379,10 @@ class BilibiliClient:
         unlocked = [t for t in chinese if not t.get("is_lock")]
         if not unlocked:
             raise AccessDenied("中文字幕轨道被锁定，停止下载。")
-        unlocked.sort(key=lambda t: t["lan"] != preferred_lang)
-        track = unlocked[0]
-        if "ai_status" in track and track["ai_status"] != 2:
-            raise RequestFailed("中文字幕状态尚未验证为可用，不能启动 ASR。")
+        ready = [t for t in unlocked if type(t.get("type")) is int and
+                 (t["type"] == 0 or t["type"] == 1 and t.get("ai_status") == 2)]
+        if not ready:
+            raise RequestFailed("中文字幕类型或状态尚未验证为可用，不能启动 ASR。")
+        preferred = normalize_language(preferred_lang)
+        track = next((t for t in ready if normalize_language(t["lan"]) == preferred), ready[0])
         return VideoResult(info, SubtitleState.CHINESE, self._body(track, info), languages)
-
-    def fetch(self, url, preferred_lang="zh-CN"):
-        return self._retry(lambda: self._fetch(url, preferred_lang))

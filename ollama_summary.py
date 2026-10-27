@@ -78,11 +78,14 @@ def generate_summary(text: str, model: str, base_url: str, timeout: float) -> st
     if result.get("error"):
         raise SummaryError(f"Ollama 请求失败：{str(result['error'])[:500]}")
     summary = result.get("response")
-    if result.get("done") is not True or not isinstance(summary, str) or not summary.strip():
+    if result.get("done") is not True or not isinstance(summary, str):
+        raise SummaryError("Ollama 请求失败：未返回完整、非空的总结正文。")
+    summary = summary.strip()
+    if not summary:
         raise SummaryError("Ollama 请求失败：未返回完整、非空的总结正文。")
     if result.get("done_reason") == "length":
         raise SummaryError("Ollama 总结达到生成长度限制，未保存不完整总结。")
-    return summary.strip()
+    return summary
 
 
 def summarize_file(source: Path, model: str, output: Path | None = None,
@@ -92,9 +95,12 @@ def summarize_file(source: Path, model: str, output: Path | None = None,
     if output.resolve() == source.resolve():
         raise SummaryError("总结输出路径不能与原始字幕相同。")
     try:
-        text = source.read_text(encoding="utf-8-sig")
+        raw_text = source.read_bytes()
+        text = raw_text.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     except (OSError, UnicodeError) as exc:
         raise SummaryError(f"无法读取 UTF-8 字幕文件：{source}") from exc
+    if not text.strip():
+        raise SummaryError("总结失败：字幕文本为空。")
     sidecar = source.with_suffix(".meta.json")
     if metadata is None and sidecar.exists():
         try:
@@ -104,7 +110,7 @@ def summarize_file(source: Path, model: str, output: Path | None = None,
     if metadata is not None:
         if not isinstance(metadata, dict) or not all(isinstance(metadata.get(k), str) for k in ("title", "desc")):
             raise SummaryError("字幕标题或简介元数据格式异常。")
-        if metadata.get("text_sha256") != hashlib.sha256(source.read_bytes()).hexdigest():
+        if metadata.get("text_sha256") != hashlib.sha256(raw_text).hexdigest():
             raise SummaryError("字幕与元数据哈希不匹配，停止使用可能错配的标题和简介。")
         video_url = video_url or metadata.get("url")
         context = f"视频标题：{metadata['title']}\n视频简介：{metadata['desc']}\n\n字幕正文：\n{text}"

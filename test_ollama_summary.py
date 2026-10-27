@@ -13,6 +13,30 @@ from ollama_summary import SummaryError, generate_summary, summarize_file
 
 
 class SummaryTests(unittest.TestCase):
+    def test_empty_subtitle_is_rejected_before_adding_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, target = Path(temp) / "empty.txt", Path(temp) / "summary.md"
+            raw = b"\xef\xbb\xbf \r\n\t"
+            source.write_bytes(raw)
+            target.write_text("existing", encoding="utf-8")
+            metadata = {"title": "标题", "desc": "简介", "text_sha256": hashlib.sha256(raw).hexdigest()}
+            with patch("ollama_summary.generate_summary") as generate, self.assertRaisesRegex(SummaryError, "文本为空"):
+                summarize_file(source, "model", target, metadata=metadata)
+            generate.assert_not_called()
+            self.assertEqual(target.read_text(encoding="utf-8"), "existing")
+
+    def test_summary_hash_and_decoding_use_one_byte_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, target = Path(temp) / "video.txt", Path(temp) / "summary.md"
+            raw = "\ufeff第一行\r\n第二行\r第三行".encode("utf-8")
+            metadata = {"title": "标题", "desc": "简介", "text_sha256": hashlib.sha256(raw).hexdigest()}
+            generate = MagicMock(return_value="总结")
+            with patch.object(Path, "read_bytes", side_effect=[raw, b"changed"]) as read:
+                summarize_file(source, "model", target, metadata=metadata, generator=generate)
+            read.assert_called_once()
+            self.assertIn("第一行\n第二行\n第三行", generate.call_args.args[0])
+            self.assertNotIn("\ufeff", generate.call_args.args[0])
+
     def test_title_description_sidecar_is_used_by_both_summary_generators(self):
         with tempfile.TemporaryDirectory() as folder:
             source, target = Path(folder) / "video.txt", Path(folder) / "video.md"

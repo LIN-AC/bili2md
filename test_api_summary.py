@@ -114,9 +114,8 @@ class APISummaryTests(unittest.TestCase):
 
     def test_provider_options_are_mutually_exclusive(self):
         with patch("sys.argv", ["bili2md.py", "--ollama-model", "local", "--api-model", "remote"]), \
-             redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
-            bili2md.main()
-        self.assertEqual(error.exception.code, 2)
+             redirect_stderr(io.StringIO()):
+            self.assertEqual(bili2md.main(), 2)
 
     def test_link_path_reuses_existing_subtitle_and_markdown_flow(self):
         for failure in [False, True]:

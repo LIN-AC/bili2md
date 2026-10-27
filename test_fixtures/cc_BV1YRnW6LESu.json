@@ -1,0 +1,36 @@
+{
+  "note": "2026-10-28 真实 CC 样本的脱敏结构。去除 Cookie 和签名参数；标题、简介、样式值及正文用测试值替换，仅保留前两个段落的字段和真实时间。",
+  "url": "https://www.bilibili.com/video/BV1YRnW6LESu",
+  "view": {
+    "bvid": "BV1YRnW6LESu",
+    "aid": 117485827262762,
+    "cid": 42964550828,
+    "title": "CC 字幕回归样本",
+    "desc": "",
+    "duration": 397,
+    "pages": [{"page": 1, "cid": 42964550828, "duration": 397}],
+    "is_upower_exclusive": false,
+    "is_upower_play": false,
+    "rights": {"pay": 0, "ugc_pay": 0, "arc_pay": 0}
+  },
+  "dm": {
+    "closed": false,
+    "subtitle": {
+      "subtitles": [
+        {"id": 2137071392833795072, "lan": "zh", "lan_doc": "中文", "type": 0, "ai_type": 0, "ai_status": 0, "subtitle_url": "https://aisubtitle.hdslb.com/bfs/subtitle/66c826adf6bac0363d905a27731f33f28faee029.json"},
+        {"id": 2135279786493571328, "lan": "ai-zh", "lan_doc": "中文（自动生成）", "type": 1, "ai_type": 0, "ai_status": 2, "subtitle_url": "https://aisubtitle.hdslb.com/bfs/ai_subtitle/prod/regression-ai"}
+      ]
+    }
+  },
+  "body": {
+    "font_size": 0.4,
+    "font_color": "#FFFFFF",
+    "background_alpha": 0.5,
+    "background_color": "#9C27B0",
+    "stroke": "none",
+    "body": [
+      {"from": 3.82, "to": 4.78, "location": 2, "content": "第一段 CC 字幕"},
+      {"from": 4.78, "to": 8.02, "location": 2, "content": "第二段 CC 字幕"}
+    ]
+  }
+}
