@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import api_summary
 import bili2md
+from test_bilibili_info import make_result
 from ollama_summary import SummaryError, summarize_file
 
 
@@ -106,7 +107,7 @@ class APISummaryTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), \
              patch("sys.argv", ["bili2md.py", "https://www.bilibili.com/video/BV1BgNb6oEnk",
                                 "--api-model", "model", "--api-base-url", "https://example.invalid/v1"]), \
-             patch("bili2md.fetch_subtitle") as fetch, redirect_stderr(io.StringIO()) as log:
+             patch("bili2md.BilibiliClient.fetch") as fetch, redirect_stderr(io.StringIO()) as log:
             self.assertEqual(bili2md.main(), 1)
         fetch.assert_not_called()
         self.assertIn("认证未配置", log.getvalue())
@@ -126,8 +127,7 @@ class APISummaryTests(unittest.TestCase):
                                         "-o", str(source), "--summary-output", str(target),
                                         "--api-model", "mock-model", "--api-base-url", "https://example.invalid/v1",
                                         "--api-key-env", "BILI2MD_TEST_KEY"]), \
-                     patch("bili2md.find_fetcher", return_value="mock-fetcher"), \
-                     patch("bili2md.fetch_subtitle", return_value="模拟已有中文字幕"), \
+                     patch("bili2md.BilibiliClient.fetch", return_value=make_result("模拟已有中文字幕")), \
                      patch("api_summary.urllib.request.build_opener", return_value=self.opener(response)), \
                      redirect_stderr(io.StringIO()) as log:
                     self.assertEqual(bili2md.main(), 1 if failure else 0)
@@ -182,7 +182,7 @@ class APISummaryTests(unittest.TestCase):
                 with patch("sys.argv", ["bili2md.py", "--input-text", str(source),
                                         "--summary-output", str(target), "--api-model", "mock-model",
                                         "--api-base-url", base + "/v1", "--api-key-env", "BILI2MD_TEST_KEY"]), \
-                     patch("bili2md.fetch_subtitle") as fetch, redirect_stderr(io.StringIO()) as log:
+                     patch("bili2md.BilibiliClient.fetch") as fetch, redirect_stderr(io.StringIO()) as log:
                     self.assertEqual(bili2md.main(), 0)
                 fetch.assert_not_called()
                 self.assertEqual(requests[0][0], "/v1/chat/completions")

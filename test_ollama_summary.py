@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import tempfile
 import unittest
@@ -7,10 +8,37 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import bili2md
+from test_bilibili_info import make_result
 from ollama_summary import SummaryError, generate_summary, summarize_file
 
 
 class SummaryTests(unittest.TestCase):
+    def test_title_description_sidecar_is_used_by_both_summary_generators(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, target = Path(folder) / "video.txt", Path(folder) / "video.md"
+            source.write_text("真实字幕正文", encoding="utf-8")
+            metadata = {"title": "真实标题", "desc": "真实简介", "url": "https://www.bilibili.com/video/BV1zvnb6eEMP/",
+                        "text_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            sidecar = source.with_suffix(".meta.json")
+            sidecar.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+            for generator in [None, MagicMock(return_value="API 模拟总结")]:
+                with patch("ollama_summary.generate_summary", return_value="Ollama 模拟总结") as local:
+                    summarize_file(source, "model", target, generator=generator)
+                invoked = generator or local
+                context = invoked.call_args.args[0]
+                for value in ["真实标题", "真实简介", "真实字幕正文"]:
+                    self.assertIn(value, context)
+                markdown = target.read_text(encoding="utf-8")
+                self.assertIn("真实标题", markdown)
+                self.assertIn("真实简介", markdown)
+            saved = target.read_bytes()
+            source.write_text("已被替换的字幕", encoding="utf-8")
+            with patch("ollama_summary.generate_summary") as generate:
+                with self.assertRaisesRegex(SummaryError, "哈希不匹配"):
+                    summarize_file(source, "model", target)
+                generate.assert_not_called()
+            self.assertEqual(target.read_bytes(), saved)
+
     def opener(self, payload):
         opener = MagicMock()
         opener.open.return_value.__enter__.return_value = io.BytesIO(
@@ -91,7 +119,7 @@ class SummaryTests(unittest.TestCase):
     def test_input_text_cli_does_not_fetch_video(self):
         with patch("sys.argv", ["bili2md.py", "--input-text", "existing.txt", "--ollama-model", "my-model"]), \
              patch("bili2md.summarize_file", return_value=Path("summaries/existing.md")) as summarize, \
-             patch("bili2md.fetch_subtitle") as fetch:
+             patch("bili2md.BilibiliClient.fetch") as fetch:
             self.assertEqual(bili2md.main(), 0)
         fetch.assert_not_called()
         self.assertEqual(summarize.call_args.args[1], "my-model")
@@ -101,8 +129,7 @@ class SummaryTests(unittest.TestCase):
             output = Path(temp) / "subtitle.txt"
             with patch("sys.argv", ["bili2md.py", "https://www.bilibili.com/video/BV1BgNb6oEnk",
                                     "-o", str(output), "--ollama-model", "my-model"]), \
-                 patch("bili2md.find_fetcher", return_value="fetcher"), \
-                 patch("bili2md.fetch_subtitle", return_value="已提取的字幕"), \
+                 patch("bili2md.BilibiliClient.fetch", return_value=make_result("已提取的字幕")), \
                  patch("bili2md.summarize_file", side_effect=SummaryError("模型不存在")):
                 self.assertEqual(bili2md.main(), 1)
             self.assertEqual(output.read_text(encoding="utf-8"), "已提取的字幕\n")

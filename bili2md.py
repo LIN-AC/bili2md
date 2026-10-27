@@ -1,7 +1,8 @@
-"""优先获取 B 站字幕，无字幕且登录有效时使用本地 whisper.cpp 转录。"""
+"""直接获取 B 站信息和中文字幕；无中文字幕时使用本地 ASR，可选生成总结。"""
 
 import argparse
 from functools import partial
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,23 +11,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import zipfile
 from urllib.parse import parse_qs, urlparse
 
 from ollama_summary import SummaryError, summarize_file
 import api_summary
+from bilibili_info import BilibiliClient, BilibiliError, SubtitleState
+from cookie_debug import cookie_check, cookie_operation, reset_cookie_debug
 
 
 class SubtitleError(Exception):
     """可以直接展示给用户的提取错误。"""
-
-
-class NoSubtitles(SubtitleError):
-    """工具返回空字幕轨道，仍需验证登录状态才能启动 ASR。"""
-
-
-class InvalidSubtitleCredential(SubtitleError):
-    """登录 API 明确返回未登录。"""
 
 
 def validate_url(value: str) -> str:
@@ -43,67 +37,6 @@ def validate_url(value: str) -> str:
     if page and (not page[0].isdigit() or int(page[0]) < 1):
         raise SubtitleError("链接错误：分 P 参数 p 必须为正整数。")
     return value
-
-
-def find_fetcher(explicit: str | None = None) -> str:
-    if explicit:
-        result = shutil.which(explicit)
-        if result:
-            return result
-        raise SubtitleError(f"依赖错误：找不到指定工具 {explicit}")
-    result = shutil.which("bilibili-subtitle-fetch")
-    if result:
-        return result
-    # uv 的 Windows 默认安装目录有时未加入 PATH。
-    fallback = Path.home() / ".local" / "bin" / "bilibili-subtitle-fetch.exe"
-    if fallback.is_file():
-        return str(fallback)
-    raise SubtitleError("依赖错误：未找到本机已安装的 bilibili-subtitle-fetch。")
-
-
-def fetch_subtitle(url: str, executable: str, config: Path | None = None,
-                   timeout: float = 120, preferred_lang: str = "zh-CN",
-                   subtitle_python: str | None = None) -> str:
-    command = [subtitle_interpreter(executable, subtitle_python),
-               str(Path(__file__).with_name("chinese_subtitle_fetch.py")),
-               "fetch", url, "--no-asr", "--no-clipboard",
-               "--output-format", "text", "--preferred-lang", preferred_lang]
-    if config:
-        command.extend(["--config", str(config.resolve())])
-    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1",
-               BILIBILI_ENABLE_ASR="false")
-    last_error = ""
-    for attempt in range(2):
-        try:
-            result = subprocess.run(command, capture_output=True, text=True,
-                                    encoding="utf-8", errors="replace",
-                                    timeout=timeout, env=env, shell=False)
-        except FileNotFoundError as exc:
-            raise SubtitleError("依赖错误：字幕工具不存在。") from exc
-        except subprocess.TimeoutExpired:
-            last_error = f"网络/HTTPS 错误：字幕请求超时（{timeout:g} 秒）。"
-        else:
-            text = result.stdout.strip()
-            for line in result.stderr.splitlines():
-                if line.startswith("字幕轨道语言："):
-                    print(line, file=sys.stderr)
-            if not result.returncode and text.startswith("Info: No subtitles"):
-                raise NoSubtitles("无可用中文字幕：可能只有非中文字幕、没有字幕，或 Cookie 无效/过期。")
-            if not result.returncode and text.startswith("Info: Subtitle file is empty"):
-                last_error = "字幕提取错误：字幕文件为空。"
-            elif result.returncode or text.startswith(("Error:", "Error fetching", "An unexpected error")):
-                detail = (result.stderr.strip() or text or f"工具退出码 {result.returncode}")
-                category = "网络/HTTPS 错误" if re.search(
-                    r"HTTP|network|connect|timeout|412|403|SSL", detail, re.I
-                ) else "字幕提取错误"
-                last_error = f"{category}：{detail}"
-            elif text:
-                return text
-            else:
-                last_error = "字幕提取错误：工具未返回字幕文本。"
-        if attempt == 0:
-            print("提取失败，正在重试一次……", file=sys.stderr)
-    raise SubtitleError(f"{last_error}\n已尝试 2 次，未保存字幕文件。")
 
 
 def default_output(url: str) -> Path:
@@ -137,59 +70,6 @@ def require_program(value: str, name: str) -> str:
     return executable
 
 
-def subtitle_interpreter(fetcher: str, subtitle_python: str | None = None) -> str:
-    # uv/pip 的 Windows launcher 内嵌安装时使用的解释器路径。
-    interpreter = subtitle_python
-    if not interpreter:
-        try:
-            with zipfile.ZipFile(fetcher) as launcher:
-                first_line = launcher.read("__main__.py").decode("utf-8").splitlines()[0]
-            if first_line.startswith("#!"):
-                interpreter = first_line[2:].strip().strip('"')
-        except (OSError, ValueError, KeyError, zipfile.BadZipFile):
-            pass
-    if not interpreter:
-        interpreter = sys.executable
-    return require_program(interpreter, "字幕工具 Python")
-
-
-def verify_subtitle_login(fetcher: str, config: Path | None, timeout: float,
-                          subtitle_python: str | None = None) -> None:
-    command = [subtitle_interpreter(fetcher, subtitle_python),
-               str(Path(__file__).with_name("check_subtitle_login.py"))]
-    if config:
-        command.append(str(config.resolve()))
-    result = run_external(command, "字幕凭证登录检查（不启动 ASR）", timeout)
-    try:
-        payload = json.loads(result.stdout)
-    except ValueError as exc:
-        raise SubtitleError("字幕凭证登录检查返回异常，未启动 ASR。") from exc
-    if payload.get("logged_in") is False:
-        raise InvalidSubtitleCredential("字幕凭证未确认登录有效，未启动 ASR。")
-    if payload.get("logged_in") is not True:
-        raise SubtitleError("字幕凭证未确认登录有效：登录检查返回异常，未启动 ASR。")
-
-
-def cookie_subtitle_config(cookies: Path, destination: Path) -> Path:
-    """将用户提供的 Netscape 凭证临时交给现有字幕工具，不改写原配置。"""
-    import http.cookiejar
-    try:
-        jar = http.cookiejar.MozillaCookieJar(str(cookies))
-        jar.load(ignore_discard=True, ignore_expires=True)
-        values = {c.name: c.value for c in jar if
-                  c.domain.lstrip(".") == "bilibili.com" or c.domain.endswith(".bilibili.com")}
-        if not values.get("SESSDATA"):
-            raise ValueError("缺少 SESSDATA")
-    except (OSError, ValueError) as exc:
-        raise SubtitleError("字幕 Cookie 已失效，且 Netscape Cookie 文件无可用登录凭证，请更新 Cookie。") from exc
-    mapping = {"sessdata": "SESSDATA", "bili_jct": "bili_jct", "buvid3": "buvid3",
-               "dedeuserid": "DedeUserID"}
-    content = "[credential]\n" + "\n".join(
-        f"{key} = {json.dumps(values[name])}" for key, name in mapping.items() if values.get(name))
-    destination.write_text(content + "\n", encoding="utf-8")
-    return destination
-
-
 def prepare_audio(audio: Path, folder: Path, ffmpeg: str, timeout: float) -> Path:
     if audio.suffix.lower() in {".flac", ".mp3", ".ogg", ".wav"}:
         print(f"音频格式 {audio.suffix} 可直接转录。", file=sys.stderr)
@@ -210,15 +90,17 @@ def transcribe_audio(url: str, cookies: Path, yt_dlp: str, ffmpeg: str,
     whisper = require_program(whisper, "whisper-cli")
     if not model.is_file() or model.stat().st_size == 0:
         raise SubtitleError(f"ASR 模型不存在或为空：{model}")
-    if not cookies.is_file():
+    if not cookie_check("bili2md.transcribe_audio", "file_is_file", cookies.is_file):
         raise SubtitleError(f"yt-dlp Cookie 文件不存在：{cookies}")
     # 只在内存中验证 Netscape 格式；Cookie 由 yt-dlp 自行读取。
     import http.cookiejar
     try:
         jar = http.cookiejar.MozillaCookieJar(str(cookies))
-        jar.load(ignore_discard=True, ignore_expires=True)
-        if not any(c.domain.lstrip(".") == "bilibili.com" or
-                   c.domain.endswith(".bilibili.com") for c in jar):
+        cookie_check("bili2md.transcribe_audio", "netscape_parse",
+                     lambda: jar.load(ignore_discard=True, ignore_expires=True))
+        if not cookie_check("bili2md.transcribe_audio", "bilibili_domain_presence",
+                            lambda: any(c.domain.lstrip(".") == "bilibili.com" or
+                                        c.domain.endswith(".bilibili.com") for c in jar)):
             raise ValueError("没有 B 站 Cookie")
     except (OSError, ValueError, http.cookiejar.LoadError) as exc:
         raise SubtitleError("yt-dlp Cookie 文件无有效 B 站 Netscape Cookie，请重新导出。") from exc
@@ -226,11 +108,13 @@ def transcribe_audio(url: str, cookies: Path, yt_dlp: str, ffmpeg: str,
         folder = Path(temp).resolve()
         # yt-dlp 会回写 Cookie jar，使用临时副本保护用户原文件。
         cookie_copy = folder / "cookies.txt"
+        cookie_operation("bili2md.transcribe_audio", "copy_for_ytdlp")
         shutil.copyfile(cookies, cookie_copy)
         manifest = folder / "download-path.txt"
         print("登录检查通过，下载音频……", file=sys.stderr)
         # 固定只选请求的分 P（默认第一 P），不下载整个合集。
         part = parse_qs(urlparse(url).query).get("p", ["1"])[0]
+        cookie_operation("bili2md.transcribe_audio", "external_cookie_file_input")
         run_external([downloader, "--ignore-config", "--no-progress", "--no-warnings",
                       "--cookies", str(cookie_copy), "--playlist-items", part,
                       "-f", "bestaudio", "-o", str(folder / "audio.%(ext)s"),
@@ -261,11 +145,14 @@ def positive_seconds(value: str) -> float:
     return number
 
 
-def cookie_path(explicit: Path | None, settings: Path) -> Path:
+def cookie_path(explicit: Path | None, settings: Path, optional: bool = False) -> Path | None:
+    cookie_operation("bili2md.cookie_path", "resolve_config_path")
     if explicit:
         return explicit.expanduser().resolve()
     if os.environ.get("BILI2MD_COOKIES"):
         return Path(os.environ["BILI2MD_COOKIES"]).expanduser().resolve()
+    if optional and not settings.exists():
+        return None
     try:
         data = json.loads(settings.read_text(encoding="utf-8"))
         value = data["cookies"]
@@ -278,14 +165,13 @@ def cookie_path(explicit: Path | None, settings: Path) -> Path:
 
 
 def main() -> int:
+    reset_cookie_debug()
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", nargs="?", help="B 站视频链接；省略则交互输入")
     parser.add_argument("-o", "--output", type=Path, help="输出 .txt 路径（已有文件会覆盖）")
-    parser.add_argument("--config", type=Path, help="字幕工具的 cookie 配置文件路径")
-    parser.add_argument("--fetcher", help="本机 bilibili-subtitle-fetch 可执行文件路径")
     parser.add_argument("--timeout", type=positive_seconds, default=120, help="每次提取超时秒数，默认 120")
     parser.add_argument("--preferred-lang", default="zh-CN", help="首选字幕语言，默认 zh-CN")
     parser.add_argument("--cookies", type=Path, help="Netscape Cookie 路径，覆盖环境变量和配置")
@@ -297,7 +183,6 @@ def main() -> int:
     parser.add_argument("--model", type=Path, default=Path(r"D:\whisper.cpp\ggml-large-v3-turbo.bin"))
     parser.add_argument("--asr-timeout", type=positive_seconds, default=3600,
                         help="下载、转换、转录各阶段超时秒数，默认 3600")
-    parser.add_argument("--subtitle-python", help="字幕工具所属 Python，默认从 Windows 启动器识别")
     parser.add_argument("--no-asr", action="store_true", help="关闭本项目 ASR 兜底，保持仅提取字幕")
     parser.add_argument("--input-text", type=Path, help="读取已有 UTF-8 字幕/ASR 文本，只生成总结")
     summaries = parser.add_mutually_exclusive_group()
@@ -335,45 +220,38 @@ def main() -> int:
             print(f"总结已保存：{summary.resolve()}")
             return 0
         url = validate_url(args.url or input("请输入 B 站视频链接："))
-        if args.config and not args.config.is_file():
-            raise SubtitleError("配置错误：指定的 cookie 配置文件不存在。")
-        fetcher = find_fetcher(args.fetcher)
-        try:
-            text = fetch_subtitle(url, fetcher, args.config, args.timeout, args.preferred_lang,
-                                  args.subtitle_python)
-        except NoSubtitles:
+        cookies = cookie_path(args.cookies, args.settings, optional=True)
+        client = BilibiliClient(cookies, args.timeout)
+        result = client.fetch(url, args.preferred_lang)
+        metadata = result.info.metadata()
+        url = result.info.url
+        print(f"视频标题：{result.info.title}")
+        print(f"字幕状态：{result.state.value}")
+        if result.state is SubtitleState.CHINESE:
+            text = result.text
+        elif result.state in {SubtitleState.OTHER_LANGUAGES, SubtitleState.NO_SUBTITLES}:
             if args.no_asr:
-                raise
-            cookies = cookie_path(args.cookies, args.settings)
-            try:
-                verify_subtitle_login(fetcher, args.config, args.timeout, args.subtitle_python)
-            except InvalidSubtitleCredential:
-                if args.config:
-                    raise  # 显式选择的配置失效时不替换用户选择。
-                print("字幕工具 Cookie 已失效，使用 Netscape Cookie 重新检查字幕……", file=sys.stderr)
-                with tempfile.TemporaryDirectory(prefix="bili2md-cookie-") as temp:
-                    config = cookie_subtitle_config(cookies, Path(temp) / "config.toml")
-                    verify_subtitle_login(fetcher, config, args.timeout, args.subtitle_python)
-                    try:
-                        text = fetch_subtitle(url, fetcher, config, args.timeout, args.preferred_lang,
-                                              args.subtitle_python)
-                    except NoSubtitles:
-                        text = transcribe_audio(url, cookies, args.yt_dlp, args.ffmpeg,
-                                                args.whisper_cli, args.model, args.asr_timeout)
-            else:
-                text = transcribe_audio(url, cookies, args.yt_dlp, args.ffmpeg,
-                                        args.whisper_cli, args.model, args.asr_timeout)
+                raise SubtitleError("无可用中文字幕，已按 --no-asr 停止。")
+            client.require_download_cookie()
+            text = transcribe_audio(url, cookies, args.yt_dlp, args.ffmpeg,
+                                    args.whisper_cli, args.model, args.asr_timeout)
+        else:
+            raise SubtitleError("无法确认字幕状态，未启动 ASR。")
         output = args.output or default_output(url)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(text + "\n", encoding="utf-8")
+        metadata["text_source"] = "subtitle" if result.state is SubtitleState.CHINESE else "asr"
+        metadata["subtitle_state"] = result.state.value
+        metadata["text_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
+        output.with_suffix(".meta.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"字幕已保存：{output.resolve()}（{len(text)} 字符）")
         if summary_model:
             print(f"正在使用 {summary_label} 总结……", file=sys.stderr)
             summary = summarize_file(output, summary_model, args.summary_output,
-                                     summary_url, summary_timeout, video_url=url, **summary_options)
+                                     summary_url, summary_timeout, video_url=url, metadata=metadata, **summary_options)
             print(f"总结已保存：{summary.resolve()}")
         return 0
-    except (SubtitleError, SummaryError, OSError, EOFError) as exc:
+    except (SubtitleError, BilibiliError, SummaryError, OSError, EOFError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
