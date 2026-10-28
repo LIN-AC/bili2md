@@ -100,11 +100,17 @@ class BilibiliInfoTests(unittest.TestCase):
             self.assertEqual(client._json.call_count, 3)
 
     def test_empty_list_with_invalid_login_is_not_no_subtitles(self):
-        client = self.client([])
-        original = client._json.side_effect
-        client._json.side_effect = lambda url, label, **kw: {"code": -101} if urlparse(url).path.endswith("/nav") else original(url, label, **kw)
-        with self.assertRaises(RequestFailed):
-            client.fetch(URL)
+        for payload, message in [({"code": -101}, "要求有效登录"),
+                                 ({"code": 0, "data": {"isLogin": False}}, "Cookie 未登录或已失效")]:
+            with self.subTest(payload=payload):
+                client = self.client([])
+                original = client._json.side_effect
+                client._json.side_effect = lambda url, label, **kw: payload if urlparse(url).path.endswith("/nav") else original(url, label, **kw)
+                with self.assertRaisesRegex(AccessDenied, message):
+                    client.fetch(URL)
+                self.assertIsNone(client._login_checked_at)
+                paths = [urlparse(c.args[0]).path for c in client._json.call_args_list]
+                self.assertEqual(paths, ["/x/web-interface/view", "/x/v2/dm/view", "/x/web-interface/nav"])
 
     def test_missing_permission_fields_and_metadata_ids_fail_closed(self):
         for key, value in [("is_upower_exclusive", None), ("bvid", "BV1BgNb6oEnk"),

@@ -1,54 +1,21 @@
 """直接读取 B 站视频信息和 dm/view 字幕；不使用播放器字幕回退。"""
 from dataclasses import asdict, dataclass
-from enum import Enum
-import errno
-from http.client import HTTPException, IncompleteRead
+from http.client import HTTPException
 import http.cookiejar
 import json
 import math
 from pathlib import Path
 import re
-import socket
-import ssl
 import sys
 import time
 import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
+from exception import (SubtitleState, BilibiliError, AccessDenied, RequestFailed, ConfigurationError,
+                       InvalidVideoURL, TransientRequestFailed, bilibili_http_error, bilibili_network_error)
+
 from cookie_debug import cookie_check, cookie_operation
-
-
-class SubtitleState(str, Enum):
-    CHINESE = "chinese"
-    OTHER_LANGUAGES = "other_languages"
-    NO_SUBTITLES = "no_subtitles"
-    ACCESS_DENIED = "access_denied"
-    REQUEST_FAILED = "request_failed"
-
-
-class BilibiliError(Exception):
-    pass
-
-
-class AccessDenied(BilibiliError):
-    state = SubtitleState.ACCESS_DENIED
-
-
-class RequestFailed(BilibiliError):
-    state = SubtitleState.REQUEST_FAILED
-
-
-class ConfigurationError(BilibiliError):
-    """启动配置或客户端初始化失败，不属于可重试的业务请求。"""
-
-
-class InvalidVideoURL(RequestFailed):
-    """当前任务的输入错误，不终止调用方进程。"""
-
-
-class TransientRequestFailed(RequestFailed):
-    """仅用于可重试的网络故障。"""
 
 
 @dataclass(frozen=True)
@@ -79,7 +46,7 @@ SHORT_HOSTS = {"b23.tv", "www.b23.tv", "bili2233.cn", "www.bili2233.cn"}
 MAX_REQUEST_ATTEMPTS = 2
 MAX_REDIRECTS = 10
 
-
+# 视频地址及分 P 属于业务校验；CLI 和服务器调用均使用同一入口。
 def parse_video_url(value: str):
     """入口与短链接跳转共用规则；返回解析结果、可选 BV 号和整数分 P。"""
     if not isinstance(value, str):
@@ -148,26 +115,6 @@ class BilibiliClient:
     def _json(self, url, label, body=False):
         return self._retry(lambda: self._json_once(url, label, body), label)
 
-    @staticmethod
-    def _http_error(exc, label):
-        status = exc.code
-        exc.close()
-        error = (TransientRequestFailed if status in {408, 500, 502, 503, 504} else
-                 AccessDenied if status in {401, 403} else RequestFailed)
-        raise error(f"{label}请求失败：HTTP {status}。") from None
-
-    @staticmethod
-    def _network_error(exc, label):
-        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-        transient = (not isinstance(reason, ssl.SSLError) and (
-            isinstance(reason, (TimeoutError, ConnectionError, IncompleteRead)) or
-            isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN or
-            isinstance(reason, OSError) and reason.errno in {
-                errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED, errno.ECONNREFUSED,
-                errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPIPE}))
-        error = TransientRequestFailed if transient else RequestFailed
-        raise error(f"{label}网络请求失败或超时。") from None
-
     def _json_once(self, url, label, body=False):
         if not body:
             cookie_operation("BilibiliClient._json", "http_cookie_processor_selection")
@@ -176,9 +123,9 @@ class BilibiliClient:
             with (self.body_opener if body else self.opener).open(request, timeout=self.timeout) as response:
                 payload = json.load(response)
         except urllib.error.HTTPError as exc:
-            self._http_error(exc, label)
+            bilibili_http_error(exc, label)
         except (OSError, urllib.error.URLError, HTTPException) as exc:
-            self._network_error(exc, label)
+            bilibili_network_error(exc, label)
         except ValueError:
             raise RequestFailed(f"{label}响应不是有效 JSON。") from None
         if not isinstance(payload, dict):
@@ -221,9 +168,9 @@ class BilibiliClient:
                     return urljoin(url, location)
                 except ValueError:
                     raise InvalidVideoURL("短链接重定向目标地址无效。") from None
-            self._http_error(exc, "短链接")
+            bilibili_http_error(exc, "短链接")
         except (OSError, urllib.error.URLError, HTTPException) as exc:
-            self._network_error(exc, "短链接")
+            bilibili_network_error(exc, "短链接")
 
     def _resolve(self, url):
         parsed, bvid, page = parse_video_url(url)
@@ -271,12 +218,13 @@ class BilibiliClient:
         if (not isinstance(duration, (int, float)) or isinstance(duration, bool) or
                 not math.isfinite(duration) or duration <= 0):
             raise RequestFailed("视频分 P 时长异常。")
-        if not isinstance(data.get("title"), str) or not data["title"].strip() or not isinstance(data.get("desc"), str):
+        if not isinstance(data.get("title"), str) or not isinstance(data.get("desc"), str):
             raise RequestFailed("视频标题或简介结构异常。")
         return VideoInfo(bvid, data["aid"], part["cid"], page, data["title"], data["desc"], duration,
                          f"https://www.bilibili.com/video/{bvid}/?p={page}")
 
     def _login(self):
+        print("登录中")
         self._login_checked_at = None
         data = cookie_check("BilibiliClient._login", "server_auth",
                             lambda: self._api("/x/web-interface/nav"))
@@ -361,10 +309,8 @@ class BilibiliClient:
         tracks = subtitle["subtitles"]
         if tracks is None or tracks == []:
             # 匿名空列表不能证明没有隐藏轨道；仅空列表判定需要验证登录。
-            try:
-                self._login()
-            except AccessDenied:
-                raise RequestFailed("匿名或失效登录下返回空字幕列表，无法确认是否真的没有字幕。") from None
+            # 保留认证失败的类型和原因，不能转换为字幕错误或启动下载。
+            self._login()
             return VideoResult(info, SubtitleState.NO_SUBTITLES)
         if not isinstance(tracks, list):
             raise RequestFailed("字幕列表类型异常。")

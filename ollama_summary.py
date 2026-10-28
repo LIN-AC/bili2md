@@ -1,5 +1,6 @@
 """通过本地 Ollama HTTP API 生成中文 Markdown 总结，仅使用标准库。"""
 import json
+from exception import SummaryError, ollama_http_error, summary_network_error
 import hashlib
 from http.client import HTTPException
 import os
@@ -8,10 +9,6 @@ import tempfile
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
-
-
-class SummaryError(Exception):
-    """总结失败，不将错误响应保存为总结。"""
 
 
 SUMMARY_SYSTEM = (
@@ -55,22 +52,9 @@ def generate_summary(text: str, model: str, base_url: str, timeout: float) -> st
         with opener.open(request, timeout=timeout) as response:
             result = json.load(response)
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            error = json.loads(exc.read(4096))
-            if isinstance(error, dict):
-                detail = str(error.get("error", ""))[:500]
-        except (ValueError, OSError):
-            pass
-        finally:
-            exc.close()
-        if exc.code == 404 and "model" in detail.lower() and "not found" in detail.lower():
-            raise SummaryError(f"Ollama 模型不存在：{model}。请指定本机已安装的模型。") from exc
-        raise SummaryError(f"Ollama 请求失败（HTTP {exc.code}）：{detail or exc.reason}") from exc
+        ollama_http_error(exc, model)
     except (TimeoutError, urllib.error.URLError, OSError, HTTPException) as exc:
-        if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
-            raise SummaryError(f"Ollama 请求超时（{timeout:g} 秒），未保存总结。") from exc
-        raise SummaryError("无法连接本机 Ollama：请确认服务已启动，且 --ollama-url 地址正确。") from exc
+        summary_network_error(exc, "Ollama", timeout)
     except (ValueError, UnicodeError) as exc:
         raise SummaryError("Ollama 请求失败：响应不是有效 JSON。") from exc
     if not isinstance(result, dict):

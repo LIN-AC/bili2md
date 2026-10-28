@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bili2md
+import media_tools
 from bilibili_info import AccessDenied, BilibiliClient, ConfigurationError, InvalidVideoURL, RequestFailed, SubtitleState, parse_video_url
 from test_bilibili_info import make_result
 
@@ -34,7 +35,7 @@ class SubtitleTests(unittest.TestCase):
             with self.subTest(url=invalid), self.assertRaises(InvalidVideoURL):
                 parse_video_url(invalid)
         self.assertEqual(parse_video_url(URL + "?p=2")[2], 2)
-        self.assertEqual(bili2md.default_output(replace(make_result().info, page=2)).name, "BV1zvnb6eEMP_p2.txt")
+        self.assertEqual(bili2md.default_output(replace(make_result().info, page=2)).name, "测试标题.txt")
         self.assertEqual(parse_video_url("https://b23.tv/abc")[0].geturl(), "https://b23.tv/abc")
 
     def test_url_rules_match_client_and_report_input_errors(self):
@@ -53,19 +54,19 @@ class SubtitleTests(unittest.TestCase):
 
 
     def test_supported_formats_skip_ffmpeg(self):
-        with patch("bili2md.run_external") as run:
+        with patch("media_tools.run_external") as run:
             for suffix in ["flac", "mp3", "ogg", "wav", "MP3"]:
                 audio = Path("audio." + suffix)
-                self.assertEqual(bili2md.prepare_audio(audio, Path("."), "ffmpeg", 10), audio)
+                self.assertEqual(media_tools.prepare_audio(audio, Path("."), "ffmpeg", 10), audio)
             run.assert_not_called()
 
 
     def test_conversion_parameters_and_missing_output(self):
         with tempfile.TemporaryDirectory() as temp, \
-             patch("bili2md.require_program", return_value="ffmpeg"), \
-             patch("bili2md.run_external") as run:
+             patch("media_tools.require_program", return_value="ffmpeg"), \
+             patch("media_tools.run_external") as run:
             with self.assertRaisesRegex(bili2md.SubtitleError, "未生成有效 WAV"):
-                bili2md.prepare_audio(Path("audio.m4a"), Path(temp), "ffmpeg", 10)
+                media_tools.prepare_audio(Path("audio.m4a"), Path(temp), "ffmpeg", 10)
             command = run.call_args.args[0]
             self.assertIn("16000", command)
             self.assertIn("pcm_s16le", command)
@@ -74,13 +75,13 @@ class SubtitleTests(unittest.TestCase):
 
     def test_external_failures_and_timeouts(self):
         for stage in ["yt-dlp 音频下载", "FFmpeg 音频转换", "whisper-cli 中文转录"]:
-            with self.subTest(stage=stage), patch("bili2md.subprocess.run", return_value=
+            with self.subTest(stage=stage), patch("media_tools.subprocess.run", return_value=
                     subprocess.CompletedProcess([], 7, "", "failed")):
                 with self.assertRaisesRegex(bili2md.SubtitleError, stage + "失败"):
-                    bili2md.run_external(["tool"], stage, 10)
-        with patch("bili2md.subprocess.run", side_effect=subprocess.TimeoutExpired("tool", 1)):
+                    media_tools.run_external(["tool"], stage, 10)
+        with patch("media_tools.subprocess.run", side_effect=subprocess.TimeoutExpired("tool", 1)):
             with self.assertRaisesRegex(bili2md.SubtitleError, "超过"):
-                bili2md.run_external(["tool"], "测试", 1)
+                media_tools.run_external(["tool"], "测试", 1)
 
 
     def test_asr_checks_download_and_transcript_outputs(self):
@@ -101,9 +102,9 @@ class SubtitleTests(unittest.TestCase):
                 # Whisper returns 0 but writes no transcript: must fail.
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            with patch("bili2md.require_program", side_effect=lambda value, name: value), \
+            with patch("media_tools.require_program", side_effect=lambda value, name: value), \
                  patch.object(client, "_api", return_value={"isLogin": True}), \
-                 patch("bili2md.run_external", side_effect=external):
+                 patch("media_tools.run_external", side_effect=external):
                 with self.assertRaisesRegex(bili2md.SubtitleError, "没有生成非空转录文本"):
                     bili2md.transcribe_audio(make_result().info, client, "yt-dlp", "ffmpeg", "whisper", model, 10)
 
@@ -142,9 +143,9 @@ class SubtitleTests(unittest.TestCase):
                     prefix = Path(command[command.index("-of") + 1])
                     prefix.with_suffix(".txt").write_text("\ufeff 中文转录 \n", encoding="utf-8")
 
-            with patch("bili2md.require_program", side_effect=lambda value, name: value), \
+            with patch("media_tools.require_program", side_effect=lambda value, name: value), \
                  patch.object(client, "_api", side_effect=login), \
-                 patch("bili2md.run_external", side_effect=external):
+                 patch("media_tools.run_external", side_effect=external):
                 self.assertEqual(bili2md.transcribe_audio(info, client, "yt-dlp", "ffmpeg", "whisper", model, 10), "中文转录")
             self.assertEqual(cookies.read_text(), "replaced source file")
 
@@ -194,7 +195,7 @@ class SubtitleTests(unittest.TestCase):
     def test_failed_download_cookie_validation_never_runs_asr(self):
         with patch("sys.argv", ["bili2md.py", URL]), \
              patch("bili2md.BilibiliClient") as client, \
-             patch("bili2md.run_external") as external:
+             patch("media_tools.run_external") as external:
             client.return_value.fetch.return_value = make_result("", SubtitleState.OTHER_LANGUAGES)
             client.return_value.require_download_cookie.side_effect = AccessDenied("Cookie 无效")
             self.assertEqual(bili2md.main(), 1)

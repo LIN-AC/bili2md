@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from unittest.mock import MagicMock, patch
 
 import bili2md
+import media_tools
 from bilibili_info import (AccessDenied, BilibiliClient, ConfigurationError, InvalidVideoURL,
                            RequestFailed, SubtitleState, TransientRequestFailed, parse_video_url)
 from ollama_summary import SummaryError
@@ -125,6 +126,25 @@ class RequestFlowTests(unittest.TestCase):
         with self.assertRaises(TransientRequestFailed):
             self.client.fetch(FIXTURE["url"])
         self.assertEqual(self.calls, Counter({VIEW: 1, DM: 1, NAV: 2}))
+
+    def test_empty_subtitles_preserve_login_error_and_stop_before_asr(self):
+        for payload, message in [({"code": -101}, "要求有效登录"),
+                                 ({"code": 0, "data": {"isLogin": False}}, "Cookie 未登录或已失效")]:
+            with self.subTest(payload=payload):
+                self.calls.clear()
+                self.payloads[DM]["data"]["subtitle"]["subtitles"] = []
+                self.payloads[NAV] = payload
+                with tempfile.TemporaryDirectory() as folder, patch("bili2md.transcribe_audio") as asr, \
+                     patch("bili2md.BilibiliClient", return_value=self.client), \
+                     patch("bili2md.cookie_path", return_value=None), \
+                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+                    target = Path(folder) / "failed.txt"
+                    self.assertEqual(bili2md.main([FIXTURE["url"], "-o", str(target)]), 1)
+                    self.assertIn(message, errors.getvalue())
+                    self.assertNotIn("无法确认是否真的没有字幕", errors.getvalue())
+                    self.assertFalse(target.exists())
+                    asr.assert_not_called()
+                self.assertEqual(self.calls, Counter({VIEW: 1, DM: 1, NAV: 1}))
 
     def test_cc_wrong_identity_language_or_content_never_becomes_asr(self):
         for location, key, value in [("dm", "cid", 99), ("dm", "oid", 99), ("track", "cid", 99),

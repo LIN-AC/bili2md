@@ -7,9 +7,11 @@ import re
 import tempfile
 import unittest
 from urllib.parse import urlparse
+from urllib.request import Request
 from unittest.mock import patch
 
 import bili2md
+import media_tools
 from bilibili_info import BilibiliClient, SubtitleState
 from cookie_debug import cookie_check, cookie_operation, reset_cookie_debug
 from test_bilibili_info import URL, body_data, view_data, zh_track
@@ -39,8 +41,8 @@ def trace_scenario(tracks):
         with patch.object(client.opener, "open", side_effect=response), patch.object(client.body_opener, "open", side_effect=response):
             result = client.fetch(URL)
             if result.state is not SubtitleState.CHINESE:
-                with patch("bili2md.require_program", side_effect=lambda value, name: value), \
-                     patch("bili2md.run_external", side_effect=bili2md.SubtitleError("模拟下载入口停止")):
+                with patch("media_tools.require_program", side_effect=lambda value, name: value), \
+                     patch("media_tools.run_external", side_effect=bili2md.SubtitleError("模拟下载入口停止")):
                     try:
                         bili2md.transcribe_audio(result.info, client, "mock-ytdlp", "mock-ffmpeg", "mock-whisper", model, 10)
                     except bili2md.SubtitleError:
@@ -49,6 +51,18 @@ def trace_scenario(tracks):
 
 
 class CookieDebugTests(unittest.TestCase):
+    def test_load_filters_expired_cookie_and_sends_session_to_nav(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "cookies.txt"
+            path.write_text("# Netscape HTTP Cookie File\n"
+                            ".bilibili.com\tTRUE\t/\tTRUE\t4102444800\tSESSDATA\tTEST_ONLY\n"
+                            ".bilibili.com\tTRUE\t/\tFALSE\t1\tEXPIRED\tTEST_ONLY\n", encoding="utf-8")
+            client = BilibiliClient(path)
+            self.assertEqual([c.name for c in client.jar], ["SESSDATA"])
+            request = Request("https://api.bilibili.com/x/web-interface/nav")
+            client.jar.add_cookie_header(request)
+            self.assertEqual(request.get_header("Cookie"), "SESSDATA=TEST_ONLY")
+
     def test_disabled_logging_preserves_action_return_and_exception(self):
         with patch.dict(os.environ, {"BILI2MD_DEBUG_COOKIE": "0"}), redirect_stderr(io.StringIO()) as log:
             self.assertEqual(cookie_check("test", "format", lambda: 42), 42)

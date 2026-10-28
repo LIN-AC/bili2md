@@ -1,12 +1,13 @@
 """最小 OpenAI-compatible Chat Completions 总结适配，仅从环境变量读取 Key。"""
 from http.client import HTTPException
 import json
+from exception import SummaryError, api_http_error, summary_network_error
 import os
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-from ollama_summary import SUMMARY_SYSTEM, SummaryError, summary_prompt
+from ollama_summary import SUMMARY_SYSTEM, summary_prompt
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -62,21 +63,9 @@ def generate_summary(text: str, model: str, base_url: str, timeout: float,
         with opener.open(request, timeout=timeout) as response:
             result = json.load(response)
     except urllib.error.HTTPError as exc:
-        status = exc.code
-        exc.close()
-        hints = {400: "请求参数不被服务支持，请检查模型和接口兼容性",
-                 401: "认证失败，请检查 API Key 是否有效",
-                 403: "无访问权限，请检查 Key 和模型权限",
-                 404: "接口或模型不存在，请检查 base_url 和模型名",
-                 429: "请求受限或额度不足，请检查服务限额"}
-        hint = ("服务返回重定向，请配置最终 base_url" if 300 <= status < 400 else
-                hints.get(status, "服务端错误，请稍后重试" if status >= 500 else "请检查服务配置"))
-        # 不输出服务端响应、URL 或异常原文，避免其中回显认证信息。
-        raise SummaryError(f"API 请求失败（HTTP {status}）：{hint}。") from None
+        api_http_error(exc)
     except (TimeoutError, urllib.error.URLError, OSError, HTTPException) as exc:
-        if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
-            raise SummaryError(f"API 请求超时（{timeout:g} 秒），未保存总结。") from None
-        raise SummaryError("API 连接失败：请检查网络、TLS 证书、代理及服务地址。") from None
+        summary_network_error(exc, "API", timeout)
     except (ValueError, UnicodeError):
         raise SummaryError("API 请求失败：响应不是有效 JSON 或请求配置无效。") from None
     if not isinstance(result, dict) or result.get("error"):
