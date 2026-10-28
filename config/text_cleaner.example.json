@@ -1,0 +1,10 @@
+{
+  "model": "qwen3:14b-q4_K_M",
+  "base_url": "http://localhost:11434",
+  "timeout": 600,
+  "num_ctx": 8192,
+  "num_predict": 4096,
+  "temperature": 0,
+  "top_p": 0.9,
+  "seed": 42
+}

@@ -37,7 +37,11 @@ def parse_args(argv=None):
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="本机 Ollama 服务地址")
     parser.add_argument("--ollama-timeout", type=positive_seconds, default=600, help="总结请求超时秒数")
     parser.add_argument("--summary-output", type=Path, help="总结 Markdown 路径，默认 summaries/<字幕文件名>.md")
+    parser.add_argument("--llm-clean", action="store_true", help="基础清洗后启用独立本地 Qwen 纠错")
+    parser.add_argument("--cleaner-config", type=Path, help="独立清洗 JSON 配置，不读取总结配置")
     args = parser.parse_args(argv)
+    if args.cleaner_config and not args.llm_clean:
+        parser.error("--cleaner-config 需要 --llm-clean")
     if args.input_text and (args.url or args.output):
         parser.error("--input-text 不能与视频链接或 --output 同时使用")
     if (args.input_text or args.summary_output) and not (args.ollama_model or args.api_model):

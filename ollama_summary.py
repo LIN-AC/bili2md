@@ -6,9 +6,11 @@ from http.client import HTTPException
 import os
 from pathlib import Path
 import tempfile
+import sys
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
+from text_cleaning import clean_text, save_cleaned_text
 
 
 SUMMARY_SYSTEM = (
@@ -74,13 +76,13 @@ def generate_summary(text: str, model: str, base_url: str, timeout: float) -> st
 
 def summarize_file(source: Path, model: str, output: Path | None = None,
                    base_url: str = "http://127.0.0.1:11434", timeout: float = 600,
-                   video_url: str | None = None, *, generator=None, metadata: dict | None = None) -> Path:
+                   video_url: str | None = None, *, generator=None, metadata: dict | None = None, cleaner=None) -> Path:
     output = output or Path("summaries") / (source.stem + ".md")
     if output.resolve() == source.resolve():
         raise SummaryError("总结输出路径不能与原始字幕相同。")
     try:
         raw_text = source.read_bytes()
-        text = raw_text.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+        text = raw_text.decode("utf-8-sig")
     except (OSError, UnicodeError) as exc:
         raise SummaryError(f"无法读取 UTF-8 字幕文件：{source}") from exc
     if not text.strip():
@@ -97,6 +99,14 @@ def summarize_file(source: Path, model: str, output: Path | None = None,
         if metadata.get("text_sha256") != hashlib.sha256(raw_text).hexdigest():
             raise SummaryError("字幕与元数据哈希不匹配，停止使用可能错配的标题和简介。")
         video_url = video_url or metadata.get("url")
+    text = clean_text(text, metadata.get("text_source", "unknown") if metadata else "unknown")
+    if not text:
+        raise SummaryError("总结失败：清洗后字幕文本为空。")
+    cleaned_path = save_cleaned_text(source, text, reserved_paths=(output, sidecar))
+    print(f"清洗文本已保存：{cleaned_path.resolve()}", file=sys.stderr)
+    if cleaner is not None:
+        text = cleaner(text)
+    if metadata is not None:
         context = f"视频标题：{metadata['title']}\n视频简介：{metadata['desc']}\n\n字幕正文：\n{text}"
     else:
         context = text

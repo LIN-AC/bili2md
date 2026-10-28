@@ -9,6 +9,7 @@ summaries/
 # 本地配置和凭证；仅提交不含秘密的示例配置。
 config/*
 !config/settings.example.json
+!config/text_cleaner.example.json
 !config/README.md
 .env
 .env.*

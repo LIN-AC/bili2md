@@ -1,7 +1,7 @@
 # bili2md：B 站信息、中文字幕、本地 ASR 与视频总结
 
-当前版本：**1.3.3**。包含 CLI、公共异常和媒体工具职责整理，视频标题文件命名及登录异常传播修复；保留 Cookie、请求级重试和 CC 字幕优化。
-Git 标签 `v1.3.3` 对应本次发布；`v1.3.1` 保留历史快照。
+当前版本：**2.0**。新增独立基础文本清洗与可选本地 Qwen 清洗，保留原文、清洗副本和独立模型配置；保留已有字幕、ASR 及总结功能。
+Git 标签 `v2.0` 对应本次发布，旧版本标签保留历史快照。
 Python 3.10+ 标准库实现，不需要安装 Python 依赖。
 
 ## 使用方式
@@ -29,6 +29,93 @@ python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --ollama-model "q
 同名 `.meta.json` 保存标题、简介、BV/AID/CID、分 P、时长、视频链接、文本来源、字幕状态和原文哈希，
 不保存 Cookie 或字幕签名 URL。标题来自已获取的视频信息，不增加信息请求。
 接口、权限或 ASR 失败不会写入新原文或启动总结。
+
+## 基础文本清洗
+
+调用链为字幕或 ASR → 保存原文及元数据 → 清洗并另存副本 → 可选模型总结。
+`text_cleaning.py` 提供纯函数 `clean_text(text, source="unknown", terms=None)`
+（`terms` 是仅限关键字参数）和 `save_cleaned_text()`；清洗不访问网络、不调用模型。
+未启用总结时也保存清洗副本；`--input-text` 通过共用的 `summarize_file()` 接入同一流程，
+Ollama 与 API 都使用清洗后的正文，标题、简介和模型接口保持不变。
+
+原始 `.txt` 和 `.meta.json` 不被清洗修改，哈希始终校验原始文件字节。
+清洗副本保存在原文目录，例如 `标题.cleaned.txt`，重名使用 `标题.cleaned (2).txt`，
+独占创建以避免覆盖。每次总结生成新的清洗副本，便于与原文比较；模型失败时也保留副本。
+原有显式 `-o` 覆盖原文的行为不变。清洗副本保存失败会停止任务，不继续调用模型。
+
+规则与边界：
+
+- 去除开头的 UTF-8 BOM；统一 CRLF、CR、Unicode 行/段分隔符为 LF。
+- 行内连续空白（含制表符、不换行空格）变为单个空格，去除行首尾空白；不删除词间空格。
+- CC/AI 已由字幕模块转换为按片段换行的文本，`source="subtitle"` 删除空片段行。
+- ASR 与未知来源保留段落间一个空行；不猜测句子边界，不拼接非空行。
+- 不删除任何重复句子，不改变非空行顺序，不改写数字、否定词、标点或专有名词。
+- 术语表默认为空，只供调用方明确传入；区分大小写、匹配完整词项，长词优先且不级联替换。
+  中文内部子串不会匹配，避免无分词依据的替换。本轮不增加术语配置文件或 CLI 参数。
+
+独立调用示例：
+
+```python
+from text_cleaning import clean_text
+
+cleaned = clean_text("  使用\t PyTorch  2.5\n\n不要删除。\n不要删除。", "subtitle")
+# 使用 PyTorch 2.5\n不要删除。\n不要删除。
+```
+
+当前不处理 SRT/VTT 解析、时间戳删除、HTML 标签剥离、口头语删除、重复片段推断、
+标点恢复、代码缩进还原或 ASR 语义纠错；这些内容缺少可靠依据时原样保留。
+现有字幕接口/ASR 返回的是纯文本，本轮未增加原始 HTTP JSON 或音频保存功能。
+
+专用回归：`python -B -m unittest test_text_cleaning -q`，包含 16 个小样例与流程测试，
+覆盖空白、重复、来源差异、术语边界、原文和元数据保护、重名、模型/写入失败及两种总结入口。
+
+## 可选的本地 Qwen 清洗
+
+使用 `--llm-clean` 显式启用；不传此参数时仍只有基础清洗。
+配置由 `text_cleaner.CleanerConfig` 独立管理，可通过 `--cleaner-config` 指定 JSON 文件，
+参考 `config/text_cleaner.example.json`。未指定配置文件时使用如下默认值，
+完全不读取 API Key、总结模型、总结 URL 或总结生成参数。
+
+| 配置项 | 默认值 | 含义 |
+| --- | --- | --- |
+| model | qwen3:14b-q4_K_M | 本机安装的模型标签 |
+| base_url | http://localhost:11434 | 本机 Ollama 根地址，只允许回环地址 |
+| timeout | 600 | 每个分块请求的超时秒数 |
+| num_ctx | 8192 | 上下文长度 |
+| num_predict | 4096 | 每块最大输出 token 数 |
+| temperature | 0 | 生成温度 |
+| top_p | 0.9 | 采样参数 |
+| seed | 42 | 随机种子，不保证跨设备确定性 |
+
+```powershell
+# 获取视频 → 基础清洗 → Qwen 清洗，不生成总结
+python bili2md.py "https://www.bilibili.com/video/BV1YRnW6LESu" --llm-clean
+
+# 已有文本 → 基础清洗 → 独立 Qwen 清洗 → 原有总结模型
+python bili2md.py --input-text "subtitles/demo.txt" --llm-clean --cleaner-config "config/text_cleaner.example.json" --ollama-model "qwen2.5:7b"
+```
+
+清洗输出为 `demo.qwen.cleaned.txt`，基础副本为 `demo.cleaned.txt`，两者均独占创建，重名自动编号。
+原文及元数据哈希不变；原有总结模型选择逻辑不变。总结共用入口只接受一个可选清洗回调，
+不负责选择清洗模型；`text_cleaner.py` 不导入总结模块。
+
+接口为 `clean_text(text, config) -> str`，输入应先经过 `text_cleaning.clean_text()`。
+通过 Ollama `/api/generate` 请求非流式 JSON 正文，关闭 thinking。
+按保守 UTF-8 字节预算分块，优先在句末/换行处分割，保留边界空白并按顺序合并。
+预算为提示词、JSON 和输出留空间，但不是精确的模型 tokenizer；不支持跨块上下文纠错。
+每块最多请求一次，失败即停止，不回退为“清洗成功”，所有块通过后才保存 Qwen 副本。
+超时、连接失败、HTTP 错误、JSON 异常、截断及可疑输出均报错，CLI 返回 1，不继续总结。
+基础文本与原文保留；失败时已有总结不变。日志只记录模型标签、处理块数、耗时和固定错误原因，
+不记录提示词、原始服务错误正文或凭证。
+
+输出检查会比较数字、英文标识符及中文否定/限定词的顺序与次数，并限制长度和字符改动幅度。
+因此部分合理的术语改动也可能被拒绝；它不能证明语义等价，尤其不能可靠识别所有中文专有名词、
+小幅语义反转或上下文遗漏。需对照保留的文件抽查，不能把通过规则检查视作事实核验。
+
+离线回归：`python -X utf8 -B -m unittest test_text_cleaner -v`。
+
+2.0 发布验证：108 项完整回归通过；本机 Qwen 短样例测试通过，用户普通视频测试通过。
+已知待查问题：用户测试科技类视频时，LLM 清洗被阻止，具体原因尚未定位；本版本保留当前检查与失败策略。
 
 ## 直接接口与五种状态
 
@@ -152,7 +239,7 @@ python bili2md.py --input-text "subtitles/BV1BgNb6oEnk_p1.txt" --api-base-url "h
 异常类型在原模块继续以导入名称可用，类身份及继承语义保持一致；未引入新框架。
 URL/BV/分 P 和跳转白名单仍属于业务校验，供 CLI 与未来服务器共同使用，不搬入 CLI 造成反向依赖。
 
-当前 81 项回归通过。重构时基于原版本临时副本与工作区分别执行模拟日志：
+1.3.3 发布时 81 项回归通过。重构时基于原版本临时副本与工作区分别执行模拟日志：
 中文字幕前后均 2 次检查；其他语言转 ASR、空列表转 ASR 前后均 4 次检查（各 1 次服务端登录）。
 四项分别为文件存在、格式解析/过期过滤、有效 B 站域和服务端认证，语义不同，不机械合并。
 文件只加载一次；一分钟内的成功登录结果复用，新提取或超时后重新检查，下载导出已验证的内存 jar。
