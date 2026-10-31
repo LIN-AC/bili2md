@@ -62,8 +62,9 @@ class RequestFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, patch("bili2md.transcribe_audio") as asr:
             target = Path(folder) / "cc.txt"
             self.assertEqual(self.run_cli(target), 0)
-            self.assertEqual(target.read_text(encoding="utf-8"), "第一段 CC 字幕\n第二段 CC 字幕\n")
             metadata = json.loads(target.with_suffix(".meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(target.read_text(encoding="utf-8"),
+                             bili2md.format_source(metadata['title'], metadata['desc'], "第一段 CC 字幕\n第二段 CC 字幕\n"))
             self.assertEqual((metadata["bvid"], metadata["cid"], metadata["page"]),
                              ("BV1YRnW6LESu", 42964550828, 1))
             self.assertEqual(metadata["text_source"], "subtitle")

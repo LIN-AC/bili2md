@@ -27,21 +27,17 @@ def parse_args(argv=None):
     parser.add_argument("--asr-timeout", type=positive_seconds, default=3600,
                         help="下载、转换、转录各阶段超时秒数，默认 3600")
     parser.add_argument("--no-asr", action="store_true", help="关闭本项目 ASR 兜底，保持仅提取字幕")
-    parser.add_argument("--input-text", type=Path, help="读取已有 UTF-8 字幕/ASR 文本，只生成总结")
+    parser.add_argument("--input-text", type=Path, help="读取已有 UTF-8 字幕/ASR 文本，生成总结")
     summaries = parser.add_mutually_exclusive_group()
-    summaries.add_argument("--ollama-model", help="启用总结，并指定本机 Ollama 模型名")
-    summaries.add_argument("--api-model", help="启用云端 API 总结，指定兼容接口的模型名")
+    summaries.add_argument("--ollama-model", help="本机 Ollama 总结模型")
+    summaries.add_argument("--api-model", help="兼容 API 总结模型")
     parser.add_argument("--api-base-url", help="OpenAI-compatible API 根地址，通常包含 /v1")
     parser.add_argument("--api-key-env", default="BILI2MD_API_KEY", help="保存 API Key 的环境变量名称")
-    parser.add_argument("--api-timeout", type=positive_seconds, default=600, help="API 总结请求超时秒数")
+    parser.add_argument("--api-timeout", type=positive_seconds, default=600, help="API 请求超时秒数")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="本机 Ollama 服务地址")
-    parser.add_argument("--ollama-timeout", type=positive_seconds, default=600, help="总结请求超时秒数")
+    parser.add_argument("--ollama-timeout", type=positive_seconds, default=600, help="Ollama 请求超时秒数")
     parser.add_argument("--summary-output", type=Path, help="总结 Markdown 路径，默认 summaries/<字幕文件名>.md")
-    parser.add_argument("--llm-clean", action="store_true", help="基础清洗后启用独立本地 Qwen 纠错")
-    parser.add_argument("--cleaner-config", type=Path, help="独立清洗 JSON 配置，不读取总结配置")
     args = parser.parse_args(argv)
-    if args.cleaner_config and not args.llm_clean:
-        parser.error("--cleaner-config 需要 --llm-clean")
     if args.input_text and (args.url or args.output):
         parser.error("--input-text 不能与视频链接或 --output 同时使用")
     if (args.input_text or args.summary_output) and not (args.ollama_model or args.api_model):

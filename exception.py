@@ -48,10 +48,6 @@ class SummaryError(Exception):
     """总结失败，不将错误响应保存为总结。"""
 
 
-class CleaningError(SubtitleError):
-    """LLM 清洗失败或输出未通过保守检查，不继续总结。"""
-
-
 def bilibili_http_error(exc, label):
     status = exc.code
     exc.close()

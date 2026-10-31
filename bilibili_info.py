@@ -224,7 +224,6 @@ class BilibiliClient:
                          f"https://www.bilibili.com/video/{bvid}/?p={page}")
 
     def _login(self):
-        print("登录中")
         self._login_checked_at = None
         data = cookie_check("BilibiliClient._login", "server_auth",
                             lambda: self._api("/x/web-interface/nav"))

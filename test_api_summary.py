@@ -130,7 +130,9 @@ class APISummaryTests(unittest.TestCase):
                      patch("api_summary.urllib.request.build_opener", return_value=self.opener(response)), \
                      redirect_stderr(io.StringIO()) as log:
                     self.assertEqual(bili2md.main(), 1 if failure else 0)
-                self.assertEqual(source.read_text(encoding="utf-8"), "模拟已有中文字幕\n")
+                info = make_result().info
+                self.assertEqual(source.read_text(encoding="utf-8"),
+                                 bili2md.format_source(info.title, info.desc, "模拟已有中文字幕\n"))
                 self.assertEqual(target.exists(), not failure)
                 self.assertNotIn(self.key, log.getvalue())
 

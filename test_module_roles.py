@@ -66,7 +66,7 @@ class ModuleRoleTests(unittest.TestCase):
             self.assertEqual(first.name, '同名 (3).txt')
             self.assertEqual(second.name, '同名 (4).txt')
             self.assertEqual(base.read_bytes(), b'existing')
-            self.assertEqual(first.read_bytes(), b'first')
+            self.assertEqual(first.read_bytes(), ollama_summary.format_source(make_result().info.title, make_result().info.desc, 'first').encode())
             self.assertEqual(base.with_name('同名 (2).meta.json').read_bytes(), b'metadata')
 
     def test_summary_collision_and_exclusive_create_race(self):
@@ -98,7 +98,7 @@ class ModuleRoleTests(unittest.TestCase):
                 self.assertEqual(bili2md.main([result.info.url]), 0)
                 self.assertEqual(client.return_value.fetch.call_count, 2)
                 asr.assert_not_called()
-            self.assertEqual(base.read_bytes(), '实际正文\n'.encode())
+            self.assertEqual(base.read_bytes(), ollama_summary.format_source(result.info.title, result.info.desc, '实际正文\n').encode())
             numbered = base.with_name('视频标题 (2).txt')
             self.assertEqual(numbered.read_bytes(), base.read_bytes())
             self.assertEqual(json.loads(numbered.with_suffix('.meta.json').read_text(encoding='utf-8'))['title'], result.info.title)

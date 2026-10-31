@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import bili2md
 from test_bilibili_info import make_result
-from ollama_summary import SummaryError, generate_summary, summarize_file
+from ollama_summary import SummaryError, generate_summary, summarize_file, format_source
 
 
 class SummaryTests(unittest.TestCase):
@@ -34,7 +34,7 @@ class SummaryTests(unittest.TestCase):
             with patch.object(Path, "read_bytes", side_effect=[raw, b"changed"]) as read:
                 summarize_file(source, "model", target, metadata=metadata, generator=generate)
             read.assert_called_once()
-            self.assertIn("第一行\n第二行\n第三行", generate.call_args.args[0])
+            self.assertIn("第一行\r\n第二行\r第三行", generate.call_args.args[0])
             self.assertNotIn("\ufeff", generate.call_args.args[0])
 
     def test_title_description_sidecar_is_used_by_both_summary_generators(self):
@@ -156,7 +156,7 @@ class SummaryTests(unittest.TestCase):
                  patch("bili2md.BilibiliClient.fetch", return_value=make_result("已提取的字幕")), \
                  patch("bili2md.summarize_file", side_effect=SummaryError("模型不存在")):
                 self.assertEqual(bili2md.main(), 1)
-            self.assertEqual(output.read_text(encoding="utf-8"), "已提取的字幕\n")
+            self.assertEqual(output.read_text(encoding="utf-8"), format_source(make_result().info.title, make_result().info.desc, "已提取的字幕\n"))
 
 
 if __name__ == "__main__":

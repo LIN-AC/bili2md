@@ -8,13 +8,11 @@ from pathlib import Path
 import re
 import sys
 
-from ollama_summary import summarize_file
+from ollama_summary import summarize_file, format_source
 from exception import SubtitleError, SummaryError, TASK_ERRORS, cli_error
 from bili_cli import parse_args, read_input
 from media_tools import transcribe_audio
-from text_cleaning import clean_text, save_cleaned_text
 import api_summary
-import text_cleaner
 from bilibili_info import BilibiliClient, BilibiliError, SubtitleState, VideoInfo, ConfigurationError
 from cookie_debug import cookie_operation, reset_cookie_debug
 
@@ -30,6 +28,7 @@ def default_output(info: VideoInfo) -> Path:
 
 def save_text(info: VideoInfo, raw_text: bytes, explicit: Path | None = None) -> Path:
     """默认标题名用独占创建防止重名覆盖；显式 -o 保留原覆盖约定。"""
+    raw_text = format_source(info.title, info.desc, raw_text.decode('utf-8')).encode('utf-8')
     base = explicit or default_output(info)
     base.parent.mkdir(parents=True, exist_ok=True)
     if explicit is not None:
@@ -77,11 +76,6 @@ def run_task(args) -> int:
     summary_timeout = args.ollama_timeout
     summary_options = {}
     summary_label = "Ollama"
-    cleaner_config = text_cleaner.load_config(args.cleaner_config) if args.llm_clean else None
-    if cleaner_config and args.input_text:
-        source = args.input_text
-        summary_options["cleaner"] = partial(text_cleaner.clean_and_save, source=source, config=cleaner_config,
-            reserved_paths=(args.summary_output or Path("summaries") / (source.stem + ".md"),))
     if args.api_model is not None:
         try:
             api_summary.api_config(args.api_model, args.api_base_url, args.api_key_env)
@@ -116,23 +110,14 @@ def run_task(args) -> int:
     output = save_text(result.info, raw_text, args.output)
     metadata["text_source"] = "subtitle" if result.state is SubtitleState.CHINESE else "asr"
     metadata["subtitle_state"] = result.state.value
-    metadata["text_sha256"] = hashlib.sha256(raw_text).hexdigest()
+    metadata["text_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
     output.with_suffix(".meta.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"字幕已保存：{output.resolve()}（{len(text)} 字符）")
-    if cleaner_config:
-        summary_options["cleaner"] = partial(text_cleaner.clean_and_save, source=output, config=cleaner_config,
-            reserved_paths=(args.summary_output or Path("summaries") / (output.stem + ".md"),))
     if summary_model:
         print(f"正在使用 {summary_label} 总结……", file=sys.stderr)
         summary = summarize_file(output, summary_model, args.summary_output,
                                  summary_url, summary_timeout, video_url=url, metadata=metadata, **summary_options)
         print(f"总结已保存：{summary.resolve()}")
-    else:
-        cleaned = clean_text(text, metadata["text_source"])
-        cleaned_path = save_cleaned_text(output, cleaned)
-        print(f"清洗文本已保存：{cleaned_path.resolve()}")
-        if cleaner_config:
-            summary_options["cleaner"](cleaned)
     return 0
 
 

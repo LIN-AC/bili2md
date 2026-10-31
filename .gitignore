@@ -3,13 +3,13 @@ __pycache__/
 config.toml
 subtitles/
 summaries/
+.cleaning-audit/
 *cookies*.txt
 *.m4a
 
 # 本地配置和凭证；仅提交不含秘密的示例配置。
 config/*
 !config/settings.example.json
-!config/text_cleaner.example.json
 !config/README.md
 .env
 .env.*
@@ -47,3 +47,18 @@ venv/
 .mypy_cache/
 .ruff_cache/
 *.pyo
+
+# 独立清洗工具仅保留在本机，不属于本仓库。
+/text_cleaner.py
+/text_cleaning.py
+/cleaning_validation.py
+/test_text_cleaner*.py
+/test_text_cleaning.py
+/test_clean_only_flow.py
+/test_cleaner_validation.py
+/test_cleaning_audit.py
+
+# 本地运行、测试与编辑器产物。
+/temp_test/
+/*.log
+/.qoder-credits/
